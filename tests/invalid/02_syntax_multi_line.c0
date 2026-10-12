@@ -1,0 +1,15 @@
+int test_func() {
+    int valid_var = 10;
+    int a = ;
+    valid_var = valid_var + 1;
+    
+    int b = 20;
+    b += ;
+    valid_var = valid_var + 2;
+
+    int c = 30;
+    assert();
+    valid_var = valid_var + 3;
+
+    return + ;
+}

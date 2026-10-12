@@ -1,0 +1,4 @@
+int main() {
+    string s = "hello\0world";
+    return 0;
+}
