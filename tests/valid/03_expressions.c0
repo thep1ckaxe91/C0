@@ -1,0 +1,11 @@
+int compute(int a, int b, int c) {
+    int r = a + b * c - (a << 2) / 3 % 2;
+    bool cond = (a < b && b <= c) || (a == 0 && b != 1);
+    int ternary = cond ? a : b;
+    int bitwise = (a & b) | (~c ^ a);
+    return r + ternary + bitwise;
+}
+
+int main() {
+    return compute(10, 20, 30);
+}

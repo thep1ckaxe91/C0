@@ -1,0 +1,25 @@
+struct node {
+    int val;
+    struct node* next;
+};
+
+typedef struct node* node_ptr;
+typedef int my_int;
+
+void process(node_ptr n, int count) {
+    for (my_int i = 0; i < count; i++) {
+        if (n == NULL) break;
+        n->val = n->val * 2;
+        n = n->next;
+    }
+}
+
+int main() {
+    node_ptr head = alloc(struct node);
+    head->val = 100;
+    head->next = NULL;
+    int[] arr = alloc_array(int, 10);
+    arr[0] = 5;
+    assert(arr[0] == 5);
+    return 0;
+}

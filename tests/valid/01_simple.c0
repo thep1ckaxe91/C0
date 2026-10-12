@@ -1,0 +1,18 @@
+// Simple C0 program
+/* outer /* nested */ comment */
+#use <conio>
+#use "test.h0"
+
+int main() {
+    int x = 42;
+    int hex = 0x2A;
+    bool flag = true;
+    char c = '\n';
+    string s = "hello world\t!";
+    if (x > 10 && flag) {
+        x += 5;
+    } else {
+        x = -x;
+    }
+    return x;
+}

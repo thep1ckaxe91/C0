@@ -1,0 +1,4 @@
+/* This comment is never closed
+int main() {
+    return 0;
+}
