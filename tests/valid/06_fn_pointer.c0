@@ -1,0 +1,14 @@
+typedef int binop(int a, int b);
+
+int add(int a, int b) {
+  return a + b;
+}
+
+int apply(binop* op, int x, int y) {
+  return (*op)(x, y);
+}
+
+int main() {
+  binop* f = &add;
+  return apply(f, 10, 20);
+}
