@@ -1,7 +1,6 @@
 #include "c0/driver.h"
 #include "parser.tab.hpp"
 #include <cstdio>
-#include <fstream>
 #include <iostream>
 
 // Declarations provided by Flex
@@ -38,7 +37,7 @@ void Driver::print_diagnostics(std::ostream& os) const {
 }
 
 bool Driver::is_type_name(const std::string& name) const {
-    return type_names_.find(name) != type_names_.end();
+    return type_names_.contains(name);
 }
 
 void Driver::add_type_name(const std::string& name) {

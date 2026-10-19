@@ -222,6 +222,11 @@ gdefn:
         driver->add_type_name(*$3);
         $$ = driver->make_node<c0::TypeDef>($2, *$3, make_range(@$));
     }
+  | KW_TYPEDEF fn_prototype ';'
+    {
+        driver->add_type_name($2->name);
+        $$ = driver->make_node<c0::FnTypeDef>($2->return_type, $2->name, std::move($2->params), make_range(@$));
+    }
 ;
 
 fn_prototype:

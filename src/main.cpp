@@ -1,7 +1,6 @@
 #include "c0/driver.h"
 #include <iostream>
 #include <string>
-#include <vector>
 
 void print_usage(const char* prog) {
     std::cout << "Usage: " << prog << " [options] <file.c0>\n"
