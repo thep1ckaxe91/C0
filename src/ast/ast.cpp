@@ -128,6 +128,11 @@ void Type::dump(std::ostream &os, int indent) const {
   case TypeKind::Alias:
     os << name;
     break;
+  case TypeKind::FunctionPointer:
+    if (elem_type)
+      elem_type->dump(os, 0);
+    os << "(*)";
+    break;
   }
 }
 
@@ -241,6 +246,20 @@ void AllocArrayExp::dump(std::ostream &os, int indent) const {
   os << "Count:\n";
   if (count)
     count->dump(os, indent + 2);
+}
+
+void LambdaExp::dump(std::ostream &os, int indent) const {
+  print_indent(os, indent);
+  os << "LambdaExp -> ";
+  if (return_type)
+    return_type->dump(os);
+  os << " (" << params.size() << " params)\n";
+  for (auto *p : params) {
+    if (p)
+      p->dump(os, indent + 1);
+  }
+  if (body)
+    body->dump(os, indent + 1);
 }
 
 void BlockStmt::dump(std::ostream &os, int indent) const {

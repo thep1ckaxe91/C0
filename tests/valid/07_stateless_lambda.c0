@@ -1,0 +1,8 @@
+typedef int transform_fn(int x);
+
+int main() {
+    transform_fn* double_it = [](int x) -> int {
+        return x * 2;
+    };
+    return (*double_it)(21);
+}
