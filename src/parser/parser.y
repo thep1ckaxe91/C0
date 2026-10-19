@@ -631,6 +631,11 @@ exp:
     {
         $$ = driver->make_node<c0::AllocArrayExp>($3, $5, make_range(@$));
     }
+  | '[' ']' '(' opt_param_list ')' ARROW type '{' stmt_list '}'
+    {
+        auto* body = driver->make_node<c0::BlockStmt>(std::move(*$9), make_range(@9));
+        $$ = driver->make_node<c0::LambdaExp>($7, std::move(*$4), body, make_range(@$));
+    }
 ;
 
 opt_arg_list:

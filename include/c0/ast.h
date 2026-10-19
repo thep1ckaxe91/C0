@@ -88,6 +88,7 @@ enum class TypeKind {
   String,
   Void,
   Pointer,
+  FunctionPointer,
   Array,
   Struct,
   Alias
@@ -114,6 +115,9 @@ public:
   using ASTNode::ASTNode;
   virtual bool is_lvalue() const { return false; }
 };
+
+class ParamDecl;
+class BlockStmt;
 
 class IntLitExp : public Exp {
 public:
@@ -229,6 +233,16 @@ public:
   Exp *count;
   AllocArrayExp(Type *t, Exp *c, SourceRange r = {})
       : Exp(r), alloc_type(t), count(c) {}
+  void dump(std::ostream &os, int indent = 0) const override;
+};
+
+class LambdaExp : public Exp {
+public:
+  Type *return_type;
+  std::vector<ParamDecl *> params;
+  BlockStmt *body;
+  LambdaExp(Type *ret, std::vector<ParamDecl *> p, BlockStmt *b, SourceRange r = {})
+      : Exp(r), return_type(ret), params(std::move(p)), body(b) {}
   void dump(std::ostream &os, int indent = 0) const override;
 };
 
