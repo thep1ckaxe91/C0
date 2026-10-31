@@ -1,4 +1,5 @@
 #include "c0/driver.h"
+#include "c0/typecheck/typechecker.h"
 #include <iostream>
 #include <string>
 
@@ -50,6 +51,12 @@ int main(int argc, char* argv[]) {
 
     if (!success) {
         std::cerr << "Parsing failed without specific diagnostics.\n";
+        return 1;
+    }
+
+    c0::TypeChecker type_checker(driver);
+    if (!driver.ast() || !type_checker.check(*driver.ast())) {
+        driver.print_diagnostics(std::cerr);
         return 1;
     }
 

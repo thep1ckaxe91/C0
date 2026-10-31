@@ -8,7 +8,11 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_compile_options(-Wall -Wextra -O2 -g)
+if(MSVC)
+    add_compile_options(/W4)
+else()
+    add_compile_options(-Wall -Wextra -O2 -g)
+endif()
 
 find_package(BISON 3.0 REQUIRED)
 find_package(FLEX 2.6 REQUIRED)
@@ -38,6 +42,7 @@ set(SOURCES
     src/main.cpp
     src/ast/ast.cpp
     src/parser/driver.cpp
+    src/typecheck/typechecker.cpp
     ${BISON_C0Parser_OUTPUTS}
     ${FLEX_C0Lexer_OUTPUTS}
 )

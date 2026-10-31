@@ -1,0 +1,9 @@
+int maybe_return(bool condition) {
+    if (condition) {
+        return 1;
+    }
+}
+
+int main() {
+    return 0;
+}
