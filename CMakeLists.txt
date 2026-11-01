@@ -8,7 +8,21 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_compile_options(-Wall -Wextra -O2 -g)
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Choose the build type" FORCE)
+endif()
+
+add_compile_options(-Wall -Wextra)
+
+option(ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
+if(ENABLE_SANITIZERS)
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+
+if(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+    add_compile_options(-fno-omit-frame-pointer)
+endif()
 
 find_package(BISON 3.0 REQUIRED)
 find_package(FLEX 2.6 REQUIRED)
@@ -37,6 +51,7 @@ add_flex_bison_dependency(C0Lexer C0Parser)
 set(SOURCES
     src/main.cpp
     src/ast/ast.cpp
+    src/memory/arena.cpp
     src/parser/driver.cpp
     ${BISON_C0Parser_OUTPUTS}
     ${FLEX_C0Lexer_OUTPUTS}

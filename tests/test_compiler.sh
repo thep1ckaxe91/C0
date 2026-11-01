@@ -2,8 +2,8 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${REPO_ROOT}/build"
-COMPILER="${BUILD_DIR}/c0c"
+BUILD_DIR="${BUILD_DIR:-${REPO_ROOT}/build}"
+COMPILER="${COMPILER:-${BUILD_DIR}/c0c}"
 
 # Color constants
 RED='\033[0;31m'
