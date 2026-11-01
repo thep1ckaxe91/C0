@@ -41,6 +41,7 @@ debug:
 		-DCMAKE_BUILD_TYPE=Debug \
 		-DENABLE_SANITIZERS=ON \
 		-DCMAKE_CXX_FLAGS="-O0 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
+	@ln -sf build/debug/compile_commands.json compile_commands.json
 	@echo "=== [Debug] Compiling c0c ==="
 	@cmake --build $(DEBUG_DIR)
 	@echo "=== [Debug] Running Compiler Test Suite under Sanitizers ==="

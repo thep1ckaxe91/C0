@@ -5,3 +5,5 @@ build/
 perf_data/
 *.data
 *.data.old
+
+compile_commands.json
