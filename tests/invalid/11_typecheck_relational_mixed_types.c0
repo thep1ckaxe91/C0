@@ -1,0 +1,9 @@
+int main() {
+    char character = 'a';
+    int number = 1;
+    if (character < number) {
+        return 1;
+    } else {
+        return 0;
+    }
+}

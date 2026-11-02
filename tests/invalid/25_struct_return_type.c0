@@ -1,0 +1,12 @@
+struct point {
+    int x;
+};
+
+struct point create_point() {
+    struct point* value = alloc(struct point);
+    return *value;
+}
+
+int main() {
+    return 0;
+}

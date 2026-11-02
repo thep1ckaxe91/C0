@@ -6,3 +6,7 @@ int check(int a, int b) {
             return 2;
     return 0;
 }
+
+int main() {
+    return check(1, 1);
+}

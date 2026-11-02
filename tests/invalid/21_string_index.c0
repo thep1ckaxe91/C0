@@ -1,0 +1,5 @@
+int main() {
+    string value = "hello";
+    char first = value[0];
+    return 0;
+}
