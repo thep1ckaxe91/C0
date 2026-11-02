@@ -31,7 +31,6 @@ struct TypeChecker::Impl {
   };
 
   struct StructInfo {
-    bool declared{false};
     bool defined{false};
     std::unordered_map<std::string, TypeInfo> fields;
   };
@@ -194,6 +193,10 @@ struct TypeChecker::Impl {
     return type.valid && type.kind == TypeKind::Int;
   }
 
+  bool is_char(const TypeInfo &type) const {
+    return type.valid && type.kind == TypeKind::Char;
+  }
+
   bool is_bool(const TypeInfo &type) const {
     return type.valid && type.kind == TypeKind::Bool;
   }
@@ -252,14 +255,12 @@ struct TypeChecker::Impl {
   void collect_types(const Program &program) {
     for (const TopDecl *decl : program.decls) {
       if (const auto *struct_decl = dynamic_cast<const StructDecl *>(decl)) {
-        auto &info = structs[struct_decl->name];
+        structs.try_emplace(struct_decl->name);
         if (aliases.contains(struct_decl->name) ||
-            function_aliases.contains(struct_decl->name) || info.declared ||
-            info.defined) {
+            function_aliases.contains(struct_decl->name)) {
           report(*struct_decl, "duplicate struct declaration '" +
                                    struct_decl->name + "'");
         }
-        info.declared = true;
       } else if (const auto *struct_def =
                      dynamic_cast<const StructDef *>(decl)) {
         auto &info = structs[struct_def->name];
@@ -558,7 +559,7 @@ struct TypeChecker::Impl {
       if (message.valid && message.kind != TypeKind::String) {
         report(*error->msg, "error message must have type string");
       }
-      return false;
+      return true;
     }
     if (dynamic_cast<const BreakStmt *>(&statement) != nullptr) {
       if (loop_depth == 0) {
@@ -626,8 +627,10 @@ struct TypeChecker::Impl {
       case BinaryOp::LE:
       case BinaryOp::GT:
       case BinaryOp::GE:
-        if (!is_int(lhs) || !is_int(rhs)) {
-          report(*binary, "relational operators require int operands");
+        if (!(is_int(lhs) && is_int(rhs)) &&
+            !(is_char(lhs) && is_char(rhs))) {
+          report(*binary,
+                 "relational operators require matching int or char operands");
         }
         return primitive(TypeKind::Bool);
       case BinaryOp::EQ:

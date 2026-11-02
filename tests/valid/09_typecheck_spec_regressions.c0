@@ -1,0 +1,17 @@
+struct point;
+struct point;
+struct point {
+    int x;
+};
+
+int compare(char first, char second) {
+    if (first < second) {
+        return 1;
+    } else {
+        error("characters are not ordered");
+    }
+}
+
+int main() {
+    return compare('a', 'b');
+}
