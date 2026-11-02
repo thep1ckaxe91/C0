@@ -1,0 +1,10 @@
+typedef int op1(int value);
+typedef int op2(int value);
+
+int main() {
+    op1* first = [](int value) -> int {
+        return value;
+    };
+    op2* second = first;
+    return 0;
+}

@@ -1,0 +1,12 @@
+typedef int binop(int a, int b);
+
+struct invalid_holder {
+    binop op;
+};
+
+int invalid_parameter(binop op);
+
+int main() {
+    binop op;
+    return 0;
+}

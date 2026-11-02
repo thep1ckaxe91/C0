@@ -19,6 +19,7 @@ struct TypeChecker::Impl {
     TypeKind kind{TypeKind::Void};
     std::shared_ptr<TypeInfo> element;
     std::string name;
+    std::string nominal_name;
     std::vector<TypeInfo> parameters;
     std::shared_ptr<TypeInfo> result;
     bool valid{true};
@@ -92,7 +93,9 @@ struct TypeChecker::Impl {
     case TypeKind::Struct:
       return lhs.name == rhs.name;
     case TypeKind::FunctionPointer:
-      if (!lhs.result || !rhs.result ||
+      if ((!lhs.nominal_name.empty() && !rhs.nominal_name.empty() &&
+           lhs.nominal_name != rhs.nominal_name) ||
+          !lhs.result || !rhs.result ||
           !same_type(*lhs.result, *rhs.result) ||
           lhs.parameters.size() != rhs.parameters.size()) {
         return false;
@@ -153,8 +156,11 @@ struct TypeChecker::Impl {
     case TypeKind::Alias: {
       const auto function_alias = function_aliases.find(type->name);
       if (function_alias != function_aliases.end()) {
-        return function_signature(function_alias->second->return_type,
-                                  function_alias->second->params);
+        TypeInfo signature =
+            function_signature(function_alias->second->return_type,
+                               function_alias->second->params);
+        signature.nominal_name = type->name;
+        return signature;
       }
       const auto alias = aliases.find(type->name);
       if (alias == aliases.end()) {
@@ -208,8 +214,14 @@ struct TypeChecker::Impl {
       report(declaration, "functions cannot return a struct type");
     }
     for (const ParamDecl *param : params) {
-      if (is_large_type(resolve_type(param->type))) {
+      const TypeInfo param_type = resolve_type(param->type);
+      if (is_large_type(param_type)) {
         report(*param, "function parameters cannot have a struct type");
+      }
+      if (param_type.valid && param_type.kind == TypeKind::FunctionPointer) {
+        report(*param,
+               "function parameters cannot have a function type; use a "
+               "pointer to a function type");
       }
     }
   }
@@ -303,6 +315,12 @@ struct TypeChecker::Impl {
           const TypeInfo field_type = resolve_type(field->type);
           if (is_large_type(field_type)) {
             report(*field, "struct fields cannot have a struct type");
+          }
+          if (field_type.valid &&
+              field_type.kind == TypeKind::FunctionPointer) {
+            report(*field,
+                   "struct fields cannot have a function type; use a pointer "
+                   "to a function type");
           }
           if (info.fields.contains(field->name)) {
             report(*field, "duplicate field '" + field->name +
@@ -492,6 +510,11 @@ struct TypeChecker::Impl {
       const TypeInfo type = resolve_type(declaration->type);
       if (is_large_type(type)) {
         report(*declaration, "variables cannot have a struct type");
+      }
+      if (type.valid && type.kind == TypeKind::FunctionPointer) {
+        report(*declaration,
+               "variables cannot have a function type; use a pointer to a "
+               "function type");
       }
       declare_variable(declaration->name, type, *declaration);
       if (declaration->init != nullptr) {
