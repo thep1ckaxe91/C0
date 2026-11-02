@@ -196,6 +196,7 @@ gdecl:
   | fn_prototype ';'
     {
         $$ = driver->make_node<c0::FnDecl>($1->return_type, $1->name, std::move($1->params), make_range(@$));
+        delete $1;
     }
   | TOKEN_USE_LIB
     {
@@ -216,6 +217,7 @@ gdefn:
     {
         auto* body = driver->make_node<c0::BlockStmt>(std::move(*$3), make_range(@3));
         $$ = driver->make_node<c0::FnDef>($1->return_type, $1->name, std::move($1->params), body, make_range(@$));
+        delete $1;
     }
   | KW_TYPEDEF type any_ident ';'
     {
@@ -226,6 +228,7 @@ gdefn:
     {
         driver->add_type_name($2->name);
         $$ = driver->make_node<c0::FnTypeDef>($2->return_type, $2->name, std::move($2->params), make_range(@$));
+        delete $2;
     }
 ;
 

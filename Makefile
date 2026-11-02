@@ -40,7 +40,7 @@ debug:
 	@cmake -B $(DEBUG_DIR) -G Ninja \
 		-DCMAKE_BUILD_TYPE=Debug \
 		-DENABLE_SANITIZERS=ON \
-		-DCMAKE_CXX_FLAGS="-O0 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
+		-DCMAKE_CXX_FLAGS="-O0 -g3 -fsanitize=address,undefined -fno-omit-frame-pointer"
 	@ln -sf build/debug/compile_commands.json compile_commands.json
 	@echo "=== [Debug] Compiling c0c ==="
 	@cmake --build $(DEBUG_DIR)
@@ -72,7 +72,7 @@ relwithdebinfo:
 	@echo "=== [RelWithDebInfo] Configuring CMake with Profiling Symbols ==="
 	@cmake -B $(RELWITHDEB_DIR) -G Ninja \
 		-DCMAKE_BUILD_TYPE=RelWithDebInfo \
-		-DCMAKE_CXX_FLAGS="-O3 -g -fno-omit-frame-pointer -DNDEBUG"
+		-DCMAKE_CXX_FLAGS="-O3 -g3 -fno-omit-frame-pointer -DNDEBUG"
 	@echo "=== [RelWithDebInfo] Compiling c0c ==="
 	@cmake --build $(RELWITHDEB_DIR)
 	@echo "=== [RelWithDebInfo] Verifying Test Suite Correctness ==="
