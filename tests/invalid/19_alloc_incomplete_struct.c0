@@ -1,0 +1,6 @@
+struct point;
+
+int main() {
+    struct point* value = alloc(struct point);
+    return 0;
+}

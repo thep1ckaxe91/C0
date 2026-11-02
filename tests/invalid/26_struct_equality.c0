@@ -1,0 +1,12 @@
+struct point {
+    int x;
+};
+
+int main() {
+    struct point* first = alloc(struct point);
+    struct point* second = alloc(struct point);
+    if (*first == *second) {
+        return 0;
+    }
+    return 0;
+}

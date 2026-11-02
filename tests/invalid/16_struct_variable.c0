@@ -1,0 +1,8 @@
+struct point {
+    int x;
+};
+
+int main() {
+    struct point value;
+    return 0;
+}

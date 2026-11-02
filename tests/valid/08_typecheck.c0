@@ -1,0 +1,16 @@
+typedef int transform_fn(int value);
+
+int increment(int value) {
+    return value + 1;
+}
+
+int main() {
+    transform_fn* transform = [](int value) -> int {
+        return value + 1;
+    };
+    int result = (*transform)(increment(2));
+    for (int index = 0; index < 2; index++) {
+        result += index;
+    }
+    return result;
+}

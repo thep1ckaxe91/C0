@@ -10,3 +10,7 @@ int test_nested() {
     /* inline /* nested */ comment */
     return 1;
 }
+
+int main() {
+    return test_nested();
+}

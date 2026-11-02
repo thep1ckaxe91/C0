@@ -12,7 +12,11 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE RelWithDebInfo CACHE STRING "Choose the build type" FORCE)
 endif()
 
-add_compile_options(-Wall -Wextra)
+if(MSVC)
+    add_compile_options(/W4)
+else()
+    add_compile_options(-Wall -Wextra)
+endif()
 
 option(ENABLE_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 if(ENABLE_SANITIZERS)
@@ -22,6 +26,7 @@ endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     add_compile_options(-fno-omit-frame-pointer)
+endif()
 endif()
 
 find_package(BISON 3.0 REQUIRED)
@@ -53,6 +58,7 @@ set(SOURCES
     src/ast/ast.cpp
     src/memory/arena.cpp
     src/parser/driver.cpp
+    src/typecheck/typechecker.cpp
     ${BISON_C0Parser_OUTPUTS}
     ${FLEX_C0Lexer_OUTPUTS}
 )

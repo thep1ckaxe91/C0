@@ -1,0 +1,4 @@
+int main() {
+    void[] values = alloc_array(void, 4);
+    return 0;
+}

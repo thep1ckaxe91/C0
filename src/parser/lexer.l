@@ -95,6 +95,8 @@ static bool parse_c0_char(const char* text, size_t len, char& out, std::string& 
 %option yylineno
 %option nounput
 %option noinput
+%option never-interactive
+%option nounistd
 %option extra-type="c0::Driver*"
 
 %x IN_COMMENT
