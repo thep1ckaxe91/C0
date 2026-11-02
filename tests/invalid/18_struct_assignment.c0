@@ -1,0 +1,10 @@
+struct point {
+    int x;
+};
+
+int main() {
+    struct point* first = alloc(struct point);
+    struct point* second = alloc(struct point);
+    *first = *second;
+    return 0;
+}

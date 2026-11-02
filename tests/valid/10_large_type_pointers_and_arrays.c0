@@ -1,0 +1,15 @@
+struct point {
+    int x;
+};
+
+int increment(int value) {
+    return value + 1;
+}
+
+int main() {
+    struct point* point_value = alloc(struct point);
+    struct point[] points = alloc_array(struct point, 2);
+    point_value->x = 1;
+    points[0].x = 2;
+    return increment(point_value->x + points[0].x) - 4;
+}

@@ -1,0 +1,11 @@
+struct point {
+    int x;
+};
+
+int read_point(struct point value) {
+    return 0;
+}
+
+int main() {
+    return 0;
+}

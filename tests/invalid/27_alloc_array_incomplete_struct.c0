@@ -1,0 +1,6 @@
+struct point;
+
+int main() {
+    struct point[] values = alloc_array(struct point, 4);
+    return 0;
+}

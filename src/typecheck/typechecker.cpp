@@ -113,7 +113,7 @@ struct TypeChecker::Impl {
       return true;
     }
     if (value.is_null) {
-      return target.kind == TypeKind::Pointer || target.kind == TypeKind::String;
+      return target.kind == TypeKind::Pointer;
     }
     return same_type(target, value);
   }
@@ -187,6 +187,31 @@ struct TypeChecker::Impl {
 
   bool is_void(const TypeInfo &type) const {
     return type.valid && !type.is_null && type.kind == TypeKind::Void;
+  }
+
+  bool is_large_type(const TypeInfo &type) const {
+    return type.valid && type.kind == TypeKind::Struct;
+  }
+
+  bool is_undefined_struct(const TypeInfo &type) const {
+    if (!is_large_type(type)) {
+      return false;
+    }
+    const auto found = structs.find(type.name);
+    return found == structs.end() || !found->second.defined;
+  }
+
+  void check_function_signature(Type *return_type,
+                                const std::vector<ParamDecl *> &params,
+                                const ASTNode &declaration) {
+    if (is_large_type(resolve_type(return_type))) {
+      report(declaration, "functions cannot return a struct type");
+    }
+    for (const ParamDecl *param : params) {
+      if (is_large_type(resolve_type(param->type))) {
+        report(*param, "function parameters cannot have a struct type");
+      }
+    }
   }
 
   bool is_int(const TypeInfo &type) const {
@@ -276,6 +301,9 @@ struct TypeChecker::Impl {
         }
         for (const FieldDecl *field : struct_def->fields) {
           const TypeInfo field_type = resolve_type(field->type);
+          if (is_large_type(field_type)) {
+            report(*field, "struct fields cannot have a struct type");
+          }
           if (info.fields.contains(field->name)) {
             report(*field, "duplicate field '" + field->name +
                                "' in struct '" + struct_def->name + "'");
@@ -311,6 +339,7 @@ struct TypeChecker::Impl {
     for (const auto &[name, alias] : function_aliases) {
       (void)name;
       function_signature(alias->return_type, alias->params);
+      check_function_signature(alias->return_type, alias->params, *alias);
     }
   }
 
@@ -330,6 +359,12 @@ struct TypeChecker::Impl {
                                    function_decl->params)
               : function_signature(function_def->return_type,
                                    function_def->params);
+      check_function_signature(
+          function_decl != nullptr ? function_decl->return_type
+                                   : function_def->return_type,
+          function_decl != nullptr ? function_decl->params
+                                   : function_def->params,
+          *decl);
       auto [it, inserted] =
           functions.emplace(name, FunctionInfo{signature, false});
       if (!inserted && !same_type(it->second.signature, signature)) {
@@ -380,6 +415,17 @@ struct TypeChecker::Impl {
     scope_floor = 0;
     loop_depth = 0;
     resolving_aliases.clear();
+
+    bool saw_non_use_declaration = false;
+    for (const TopDecl *decl : program.decls) {
+      if (dynamic_cast<const UseDirective *>(decl) != nullptr) {
+        if (saw_non_use_declaration) {
+          report(*decl, "#use directives must precede all other declarations");
+        }
+      } else {
+        saw_non_use_declaration = true;
+      }
+    }
 
     collect_types(program);
     collect_functions(program);
@@ -444,6 +490,9 @@ struct TypeChecker::Impl {
     if (const auto *declaration =
             dynamic_cast<const VarDeclStmt *>(&statement)) {
       const TypeInfo type = resolve_type(declaration->type);
+      if (is_large_type(type)) {
+        report(*declaration, "variables cannot have a struct type");
+      }
       declare_variable(declaration->name, type, *declaration);
       if (declaration->init != nullptr) {
         const TypeInfo value = check_expression(*declaration->init);
@@ -462,6 +511,9 @@ struct TypeChecker::Impl {
         report(*assignment, "assignment target is not an lvalue");
       }
       if (assignment->op == AssignOp::ASSIGN) {
+        if (is_large_type(target) || is_large_type(value)) {
+          report(*assignment, "struct values cannot be assigned");
+        }
         if (!compatible(target, value)) {
           report(*assignment, "assignment types do not match");
         }
@@ -635,8 +687,11 @@ struct TypeChecker::Impl {
         return primitive(TypeKind::Bool);
       case BinaryOp::EQ:
       case BinaryOp::NE:
-        if (!(lhs.is_null && rhs.is_null) && !compatible(lhs, rhs) &&
-            !compatible(rhs, lhs)) {
+        if (lhs.kind == TypeKind::String || rhs.kind == TypeKind::String ||
+            is_large_type(lhs) || is_large_type(rhs)) {
+          report(*binary, "equality operators do not support string or struct operands");
+        } else if (!(lhs.is_null && rhs.is_null) && !compatible(lhs, rhs) &&
+                   !compatible(rhs, lhs)) {
           report(*binary, "equality operands have incompatible types");
         }
         return primitive(TypeKind::Bool);
@@ -662,13 +717,12 @@ struct TypeChecker::Impl {
               return pointer_to(found->second.signature);
             }
           }
-        }
-        const TypeInfo operand = check_expression(*unary->operand);
-        if (!is_lvalue(unary->operand)) {
-          report(*unary, "address-of operator requires an lvalue or defined function");
+          report(*unary, "address-of operator requires a defined function identifier");
           return invalid_type();
         }
-        return pointer_to(operand);
+        check_expression(*unary->operand);
+        report(*unary, "address-of operator requires a defined function identifier");
+        return invalid_type();
       }
 
       const TypeInfo operand = check_expression(*unary->operand);
@@ -777,24 +831,27 @@ struct TypeChecker::Impl {
       if (!is_int(subscript)) {
         report(*index->index, "array index must have type int");
       }
-      if (base.valid && (base.kind == TypeKind::Array ||
-                         base.kind == TypeKind::Pointer) &&
-          base.element) {
+      if (base.valid && base.kind == TypeKind::Array && base.element) {
         if (is_void(*base.element)) {
-          report(*index, "cannot index a void pointer");
+          report(*index, "cannot index a void array");
           return invalid_type();
         }
         return *base.element;
       }
-      if (base.valid && base.kind == TypeKind::String) {
-        return primitive(TypeKind::Char);
-      }
-      report(*index, "indexing requires an array, pointer, or string");
+      report(*index, "indexing requires an array");
       return invalid_type();
     }
     if (const auto *allocation =
             dynamic_cast<const AllocExp *>(&expression)) {
       const TypeInfo allocated = resolve_type(allocation->alloc_type);
+      if (is_void(allocated)) {
+        report(*allocation, "cannot allocate void");
+        return invalid_type();
+      }
+      if (is_undefined_struct(allocated)) {
+        report(*allocation, "cannot allocate an undefined struct");
+        return invalid_type();
+      }
       return pointer_to(allocated);
     }
     if (const auto *allocation =
@@ -803,15 +860,24 @@ struct TypeChecker::Impl {
       if (!is_int(count)) {
         report(*allocation->count, "array allocation count must have type int");
       }
+      const TypeInfo element = resolve_type(allocation->alloc_type);
+      if (is_void(element)) {
+        report(*allocation, "cannot allocate an array of void");
+        return invalid_type();
+      }
+      if (is_undefined_struct(element)) {
+        report(*allocation, "cannot allocate an undefined struct");
+        return invalid_type();
+      }
       TypeInfo array;
       array.kind = TypeKind::Array;
-      array.element =
-          std::make_shared<TypeInfo>(resolve_type(allocation->alloc_type));
+      array.element = std::make_shared<TypeInfo>(element);
       array.valid = array.element->valid;
       return array;
     }
     if (const auto *lambda = dynamic_cast<const LambdaExp *>(&expression)) {
       TypeInfo signature = function_signature(lambda->return_type, lambda->params);
+      check_function_signature(lambda->return_type, lambda->params, *lambda);
       const size_t previous_floor = scope_floor;
       scopes.emplace_back();
       scope_floor = scopes.size() - 1;
