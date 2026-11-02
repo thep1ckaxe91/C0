@@ -82,6 +82,9 @@ relwithdebinfo:
 	@for test_file in $(ALL_TESTS); do \
 		test_name=$$(basename "$$test_file" .c0); \
 		output_data="$(PERF_DIR)/$${test_name}.data"; \
+		if [ -f "$$output_data" ]; then \
+			mv -f "$$output_data" "$$output_data.old"; \
+		fi; \
 		echo "  -> Profiling $$test_name ($$test_file) -> $$output_data"; \
 		$(PERF_RECORD) -o "$$output_data" -- bash -c ' \
 			for i in $$(seq 1 $(PERF_ITERATIONS)); do \

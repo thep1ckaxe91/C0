@@ -27,7 +27,6 @@ endif()
 if(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     add_compile_options(-fno-omit-frame-pointer)
 endif()
-endif()
 
 find_package(BISON 3.0 REQUIRED)
 find_package(FLEX 2.6 REQUIRED)
@@ -64,3 +63,6 @@ set(SOURCES
 )
 
 add_executable(c0c ${SOURCES})
+
+add_executable(test_arena tests/test_arena.cpp src/memory/arena.cpp)
+

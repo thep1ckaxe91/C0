@@ -1,8 +1,7 @@
 #pragma once
 
+#include "c0/arena.h"
 #include "c0/ast.h"
-#include <deque>
-#include <memory>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -34,26 +33,21 @@ public:
     void set_ast(Program* prog) { root_ = prog; }
     Program* ast() const { return root_; }
 
-    // Factory method using default heap allocator
+    Arena& arena() { return arena_; }
+
+    // Factory method using custom Arena allocator
     template <typename T, typename... Args>
     T* make_node(Args&&... args) {
-        auto node = std::make_unique<T>(std::forward<Args>(args)...);
-        T* raw_ptr = node.get();
-        allocated_nodes_.push_back(std::move(node));
-        return raw_ptr;
+        return arena_.create<T>(std::forward<Args>(args)...);
     }
 
     const std::string& intern_string(std::string s) {
-        strings_.push_back(std::move(s));
-        return strings_.back();
+        return *arena_.create<std::string>(std::move(s));
     }
 
     template <typename T>
     std::vector<T>* make_vector() {
-        auto vec = std::make_unique<std::vector<T>>();
-        auto* raw = vec.get();
-        allocated_vectors_.push_back(std::shared_ptr<void>(std::move(vec)));
-        return raw;
+        return arena_.create<std::vector<T>>();
     }
 
     // Type name tracking for typedef
@@ -67,10 +61,8 @@ public:
     int column{1};
 
 private:
+    Arena arena_;
     Program* root_{nullptr};
-    std::vector<std::unique_ptr<ASTNode>> allocated_nodes_;
-    std::deque<std::string> strings_;
-    std::vector<std::shared_ptr<void>> allocated_vectors_;
     std::vector<ErrorDiagnostic> diagnostics_;
     std::unordered_set<std::string> type_names_;
 };

@@ -29,6 +29,19 @@ TOTAL=0
 PASSED=0
 FAILED=0
 
+# 0. Test Custom Arena Allocator
+if [[ -x "${BUILD_DIR}/test_arena" ]]; then
+    echo -e "\n${BLUE}[Phase 0] Testing Custom Arena Allocator...${NC}"
+    TOTAL=$((TOTAL + 1))
+    if timeout 5s "${BUILD_DIR}/test_arena" > /dev/null 2>&1; then
+        echo -e "  [PASS] Arena Allocator unit tests"
+        PASSED=$((PASSED + 1))
+    else
+        echo -e "  ${RED}[FAIL]${NC} Arena Allocator unit tests failed"
+        FAILED=$((FAILED + 1))
+    fi
+fi
+
 # 1. Test Valid Snippets (Must exit 0)
 echo -e "\n${BLUE}[Phase 1] Testing Valid C0 Programs (Expect Exit Code 0)...${NC}"
 for file in "${REPO_ROOT}"/tests/valid/*.c0; do
