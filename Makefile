@@ -19,7 +19,7 @@ RELEASE_BIN       := $(RELEASE_DIR)/c0c
 RELWITHDEB_BIN    := $(RELWITHDEB_DIR)/c0c
 
 # Profiling configuration (Hotspot integration)
-PERF_RECORD       ?= perf record -F 9999 -g --call-graph fp
+PERF_RECORD       ?= taskset -c 0 perf record -F 499 -e cycles:u --call-graph dwarf,2048
 PERF_ITERATIONS   ?= 10000
 
 # Test files

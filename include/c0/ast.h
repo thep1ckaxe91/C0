@@ -2,7 +2,6 @@
 
 #include <cstdint>
 #include <iostream>
-#include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -74,7 +73,7 @@ public:
   SourceRange range;
 
   explicit ASTNode(SourceRange r = {}) : range(r) {}
-  virtual ~ASTNode() = default;
+  ~ASTNode() = default;
   virtual void dump(std::ostream &os, int indent = 0) const = 0;
 
 protected:
