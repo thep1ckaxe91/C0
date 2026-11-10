@@ -19,8 +19,8 @@ RELEASE_BIN       := $(RELEASE_DIR)/c0c
 RELWITHDEB_BIN    := $(RELWITHDEB_DIR)/c0c
 
 # Profiling configuration (Hotspot integration)
-PERF_RECORD       ?= perf record -g --call-graph fp
-PERF_ITERATIONS   ?= 10
+PERF_RECORD       ?= taskset -c 0 perf record -F 499 -e cycles:u --call-graph dwarf,2048
+PERF_ITERATIONS   ?= 10000
 
 # Test files
 VALID_TESTS       := $(wildcard tests/valid/*.c0)
@@ -40,7 +40,7 @@ debug:
 	@cmake -B $(DEBUG_DIR) -G Ninja \
 		-DCMAKE_BUILD_TYPE=Debug \
 		-DENABLE_SANITIZERS=ON \
-		-DCMAKE_CXX_FLAGS="-O0 -g3 -fsanitize=address,undefined -fno-omit-frame-pointer"
+		-DCMAKE_CXX_FLAGS="-O0 -g -fsanitize=address,undefined -fno-omit-frame-pointer"
 	@ln -sf build/debug/compile_commands.json compile_commands.json
 	@echo "=== [Debug] Compiling c0c ==="
 	@cmake --build $(DEBUG_DIR)
@@ -72,7 +72,7 @@ relwithdebinfo:
 	@echo "=== [RelWithDebInfo] Configuring CMake with Profiling Symbols ==="
 	@cmake -B $(RELWITHDEB_DIR) -G Ninja \
 		-DCMAKE_BUILD_TYPE=RelWithDebInfo \
-		-DCMAKE_CXX_FLAGS="-O3 -g3 -fno-omit-frame-pointer -DNDEBUG"
+		-DCMAKE_CXX_FLAGS="-O3 -g -fno-omit-frame-pointer -DNDEBUG"
 	@echo "=== [RelWithDebInfo] Compiling c0c ==="
 	@cmake --build $(RELWITHDEB_DIR)
 	@echo "=== [RelWithDebInfo] Verifying Test Suite Correctness ==="
@@ -85,12 +85,9 @@ relwithdebinfo:
 		if [ -f "$$output_data" ]; then \
 			mv -f "$$output_data" "$$output_data.old"; \
 		fi; \
-		echo "  -> Profiling $$test_name ($$test_file) -> $$output_data"; \
-		$(PERF_RECORD) -o "$$output_data" -- bash -c ' \
-			for i in $$(seq 1 $(PERF_ITERATIONS)); do \
-				$(RELWITHDEB_BIN) "$$test_file" > /dev/null 2>&1 || true; \
-			done \
-		'; \
+		echo "  -> Profiling $$test_name ($$test_file) [$(PERF_ITERATIONS) iterations] -> $$output_data"; \
+		$(PERF_RECORD) -o "$$output_data" -- \
+			$(RELWITHDEB_BIN) --benchmark $(PERF_ITERATIONS) "$$test_file" > /dev/null 2>&1 || true; \
 	done
 	@echo ""
 	@echo ">>> [RelWithDebInfo] Profiling complete! Generated data files in $(PERF_DIR)/:"
