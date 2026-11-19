@@ -56,7 +56,10 @@ set(SOURCES
     src/main.cpp
     src/ast/ast.cpp
     src/memory/arena.cpp
+    src/memory/symbol_table.cpp
     src/parser/driver.cpp
+    src/typecheck/type_context.cpp
+    src/typecheck/definite_init.cpp
     src/typecheck/typechecker.cpp
     ${BISON_C0Parser_OUTPUTS}
     ${FLEX_C0Lexer_OUTPUTS}
@@ -65,4 +68,17 @@ set(SOURCES
 add_executable(c0c ${SOURCES})
 
 add_executable(test_arena tests/test_arena.cpp src/memory/arena.cpp)
+
+add_executable(test_semantics
+    tests/test_semantics.cpp
+    src/ast/ast.cpp
+    src/memory/arena.cpp
+    src/memory/symbol_table.cpp
+    src/parser/driver.cpp
+    src/typecheck/type_context.cpp
+    src/typecheck/definite_init.cpp
+    src/typecheck/typechecker.cpp
+    ${BISON_C0Parser_OUTPUTS}
+    ${FLEX_C0Lexer_OUTPUTS}
+)
 

@@ -31,13 +31,24 @@ FAILED=0
 
 # 0. Test Custom Arena Allocator
 if [[ -x "${BUILD_DIR}/test_arena" ]]; then
-    echo -e "\n${BLUE}[Phase 0] Testing Custom Arena Allocator...${NC}"
+    echo -e "\n${BLUE}[Phase 0] Testing Custom Arena Allocator & Semantic Infrastructure...${NC}"
     TOTAL=$((TOTAL + 1))
     if timeout 5s "${BUILD_DIR}/test_arena" > /dev/null 2>&1; then
         echo -e "  [PASS] Arena Allocator unit tests"
         PASSED=$((PASSED + 1))
     else
         echo -e "  ${RED}[FAIL]${NC} Arena Allocator unit tests failed"
+        FAILED=$((FAILED + 1))
+    fi
+fi
+
+if [[ -x "${BUILD_DIR}/test_semantics" ]]; then
+    TOTAL=$((TOTAL + 1))
+    if timeout 5s "${BUILD_DIR}/test_semantics" > /dev/null 2>&1; then
+        echo -e "  [PASS] Semantic Infrastructure & AST Decoration unit tests"
+        PASSED=$((PASSED + 1))
+    else
+        echo -e "  ${RED}[FAIL]${NC} Semantic Infrastructure unit tests failed"
         FAILED=$((FAILED + 1))
     fi
 fi

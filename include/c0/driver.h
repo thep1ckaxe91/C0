@@ -2,8 +2,11 @@
 
 #include "c0/arena.h"
 #include "c0/ast.h"
+#include "c0/memory/symbol_table.h"
+#include "c0/typecheck/type_context.h"
+#include <cstdint>
 #include <string>
-#include <unordered_set>
+#include <string_view>
 #include <vector>
 
 namespace c0 {
@@ -34,6 +37,10 @@ public:
     Program* ast() const { return root_; }
 
     Arena& arena() { return arena_; }
+    SymbolTable& symbols() { return symbols_; }
+    const SymbolTable& symbols() const { return symbols_; }
+    TypeContext& type_context() { return type_context_; }
+    const TypeContext& type_context() const { return type_context_; }
 
     // Factory method using custom Arena allocator
     template <typename T, typename... Args>
@@ -41,9 +48,11 @@ public:
         return arena_.create<T>(std::forward<Args>(args)...);
     }
 
-    const std::string& intern_string(std::string s) {
-        return *arena_.create<std::string>(std::move(s));
+    SymbolId intern_symbol(std::string_view sv) {
+        return symbols_.intern(sv);
     }
+
+    const std::string& intern_string(std::string_view s);
 
     template <typename T>
     std::vector<T>* make_vector() {
@@ -51,8 +60,8 @@ public:
     }
 
     // Type name tracking for typedef
-    bool is_type_name(const std::string& name) const;
-    void add_type_name(const std::string& name);
+    bool is_type_name(std::string_view name) const;
+    void add_type_name(std::string_view name);
 
     // Lexer state
     int comment_depth{0};
@@ -62,9 +71,12 @@ public:
 
 private:
     Arena arena_;
+    SymbolTable symbols_;
+    TypeContext type_context_;
     Program* root_{nullptr};
     std::vector<ErrorDiagnostic> diagnostics_;
-    std::unordered_set<std::string> type_names_;
+    std::vector<const std::string*> interned_strings_;
+    std::vector<uint8_t> type_name_flags_;
 };
 
 } // namespace c0
