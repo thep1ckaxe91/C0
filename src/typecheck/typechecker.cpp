@@ -2,223 +2,254 @@
 
 #include "c0/ast.h"
 #include "c0/driver.h"
+#include "c0/memory/symbol_table.h"
+#include "c0/typecheck/definite_init.h"
+#include "c0/typecheck/type_context.h"
 
 #include <algorithm>
-#include <memory>
-#include <optional>
+#include <cstdint>
+#include <span>
 #include <string>
-#include <unordered_map>
-#include <unordered_set>
-#include <utility>
 #include <vector>
 
 namespace c0 {
 
+namespace {
+
+template <typename T> void ensure_slot(std::vector<T> &vec, SymbolId id) {
+  if (id != kInvalidSymbol && id >= vec.size()) {
+    vec.resize(id + 1);
+  }
+}
+
+void concretize_null(Exp *expr, const SemType *target) noexcept {
+  if (!expr || !target || !target->is_pointer() || !expr->sem_type ||
+      !expr->sem_type->is_null()) {
+    return;
+  }
+  expr->sem_type = target;
+  if (expr->ast_kind == ASTKind::TernaryExp) {
+    auto *tern = static_cast<TernaryExp *>(expr);
+    concretize_null(tern->true_branch, target);
+    concretize_null(tern->false_branch, target);
+  }
+}
+
+} // namespace
+
 struct TypeChecker::Impl {
-  struct TypeInfo {
-    TypeKind kind{TypeKind::Void};
-    std::shared_ptr<TypeInfo> element;
-    std::string name;
-    std::string nominal_name;
-    std::vector<TypeInfo> parameters;
-    std::shared_ptr<TypeInfo> result;
-    bool valid{true};
-    bool is_null{false};
-  };
-
   struct FunctionInfo {
-    TypeInfo signature;
+    const SemType *signature{nullptr};
     bool defined{false};
+    const FnDef *def_node{nullptr};
+    const FnDecl *decl_node{nullptr};
   };
 
-  struct StructInfo {
-    bool defined{false};
-    std::unordered_map<std::string, TypeInfo> fields;
+  struct VarBinding {
+    const SemType *type{nullptr};
+    uint32_t slot_id{kInvalidSlot};
+    SymbolKind kind{SymbolKind::LocalVar};
+    uint32_t scope_depth{0};
   };
 
-  explicit Impl(Driver &driver) : driver(driver) {}
+  struct ScopeTrailEntry {
+    SymbolId sym{kInvalidSymbol};
+    VarBinding prev_binding;
+  };
+
+  explicit Impl(Driver &d)
+      : driver(d), symbols(d.symbols()), types(d.type_context()) {}
 
   Driver &driver;
-  std::unordered_map<std::string, const TypeDef *> aliases;
-  std::unordered_map<std::string, const FnTypeDef *> function_aliases;
-  std::unordered_map<std::string, StructInfo> structs;
-  std::unordered_map<std::string, FunctionInfo> functions;
-  std::vector<std::unordered_map<std::string, TypeInfo>> scopes;
-  size_t scope_floor{0};
-  size_t loop_depth{0};
-  TypeInfo current_return_type;
+  SymbolTable &symbols;
+  TypeContext &types;
+
+  // Dense SymbolId-indexed tables (zero string hashing/allocation overhead)
+  std::vector<const TypeDef *> aliases;
+  std::vector<const FnTypeDef *> function_aliases;
+  std::vector<uint8_t> struct_declared;
+  std::vector<uint8_t> resolving_aliases;
+  std::vector<uint32_t> function_index; // SymbolId -> index+1 in functions
+  std::vector<FunctionInfo> functions;
+
+  // Flat O(1) scoped symbol table via undo trail
+  std::vector<VarBinding> active_vars;
+  std::vector<ScopeTrailEntry> scope_trail;
+  std::vector<std::size_t> scope_marks;
+  uint32_t current_scope_depth{0};
+  uint32_t scope_floor_depth{0};
+
+  uint32_t loop_depth{0};
+  const SemType *current_return_type{nullptr};
   bool checking_function{false};
-  std::unordered_set<std::string> resolving_aliases;
-
-  static TypeInfo invalid_type() {
-    TypeInfo type;
-    type.valid = false;
-    return type;
-  }
-
-  static TypeInfo null_type() {
-    TypeInfo type;
-    type.is_null = true;
-    return type;
-  }
-
-  static TypeInfo primitive(TypeKind kind) {
-    TypeInfo type;
-    type.kind = kind;
-    return type;
-  }
-
-  static TypeInfo pointer_to(TypeInfo element) {
-    TypeInfo type;
-    type.kind = TypeKind::Pointer;
-    type.valid = element.valid;
-    type.element = std::make_shared<TypeInfo>(std::move(element));
-    return type;
-  }
+  uint32_t current_local_count{0};
+  uint32_t next_lambda_id{0};
+  Program *current_program{nullptr};
 
   void report(const ASTNode &node, const std::string &message) {
     driver.report_error(node.range.start, message);
   }
 
-  bool same_type(const TypeInfo &lhs, const TypeInfo &rhs) const {
-    if (!lhs.valid || !rhs.valid || lhs.is_null || rhs.is_null ||
-        lhs.kind != rhs.kind) {
+  template <typename Ptr>
+  Ptr lookup_dense(const std::vector<Ptr> &vec, SymbolId id) const noexcept {
+    return (id < vec.size()) ? vec[id] : nullptr;
+  }
+
+  bool is_struct_declared(SymbolId id) const noexcept {
+    return id < struct_declared.size() && struct_declared[id] != 0;
+  }
+
+  FunctionInfo *find_function(SymbolId id) noexcept {
+    if (id >= function_index.size() || function_index[id] == 0) {
+      return nullptr;
+    }
+    return &functions[function_index[id] - 1];
+  }
+
+  void enter_scope() {
+    scope_marks.push_back(scope_trail.size());
+    ++current_scope_depth;
+  }
+
+  void exit_scope() {
+    const std::size_t mark = scope_marks.back();
+    scope_marks.pop_back();
+    while (scope_trail.size() > mark) {
+      const ScopeTrailEntry &entry = scope_trail.back();
+      active_vars[entry.sym] = entry.prev_binding;
+      scope_trail.pop_back();
+    }
+    --current_scope_depth;
+  }
+
+  const VarBinding *lookup_variable(SymbolId id) const noexcept {
+    if (id >= active_vars.size()) {
+      return nullptr;
+    }
+    const VarBinding &binding = active_vars[id];
+    if (binding.type == nullptr || binding.scope_depth < scope_floor_depth) {
+      return nullptr;
+    }
+    return &binding;
+  }
+
+  bool declare_variable(SymbolId id, const std::string &name,
+                        const SemType *type, SymbolKind kind,
+                        const ASTNode &node, uint32_t &out_slot) {
+    out_slot = kInvalidSlot;
+    ensure_slot(active_vars, id);
+
+    const VarBinding &existing = active_vars[id];
+    if (existing.type != nullptr && existing.scope_depth >= scope_floor_depth) {
+      report(node, "variable '" + name +
+                       "' is already declared in an enclosing or current scope");
+      return false;
+    }
+    if (find_function(id) != nullptr) {
+      report(node, "variable '" + name +
+                       "' conflicts with a function declaration");
+      return false;
+    }
+    if (type && type->is_void()) {
+      report(node, "variable '" + name + "' cannot have type void");
       return false;
     }
 
-    switch (lhs.kind) {
-    case TypeKind::Pointer:
-    case TypeKind::Array:
-      return lhs.element && rhs.element && same_type(*lhs.element, *rhs.element);
-    case TypeKind::Struct:
-      return lhs.name == rhs.name;
-    case TypeKind::FunctionPointer:
-      if ((!lhs.nominal_name.empty() && !rhs.nominal_name.empty() &&
-           lhs.nominal_name != rhs.nominal_name) ||
-          !lhs.result || !rhs.result ||
-          !same_type(*lhs.result, *rhs.result) ||
-          lhs.parameters.size() != rhs.parameters.size()) {
-        return false;
-      }
-      for (size_t i = 0; i < lhs.parameters.size(); ++i) {
-        if (!same_type(lhs.parameters[i], rhs.parameters[i])) {
-          return false;
-        }
-      }
-      return true;
-    default:
-      return true;
-    }
+    out_slot = current_local_count++;
+    scope_trail.push_back({id, existing});
+    active_vars[id] = VarBinding{type, out_slot, kind, current_scope_depth};
+    return true;
   }
 
-  bool compatible(const TypeInfo &target, const TypeInfo &value) const {
-    if (!target.valid || !value.valid) {
-      return true;
+  const SemType *function_signature(Type *return_type,
+                                    const std::vector<ParamDecl *> &params,
+                                    SymbolId nominal_name = kInvalidSymbol) {
+    const SemType *ret = resolve_type(return_type);
+    if (params.size() <= 16) {
+      const SemType *inline_params[16];
+      for (std::size_t i = 0; i < params.size(); ++i) {
+        inline_params[i] = resolve_type(params[i]->type);
+      }
+      return types.get_function(
+          ret, std::span<const SemType *const>(inline_params, params.size()),
+          nominal_name);
     }
-    if (value.is_null) {
-      return target.kind == TypeKind::Pointer;
-    }
-    return same_type(target, value);
-  }
 
-  TypeInfo function_signature(Type *return_type,
-                              const std::vector<ParamDecl *> &params) {
-    TypeInfo signature;
-    signature.kind = TypeKind::FunctionPointer;
-    signature.result =
-        std::make_shared<TypeInfo>(resolve_type(return_type));
+    std::vector<const SemType *> resolved_params;
+    resolved_params.reserve(params.size());
     for (const ParamDecl *param : params) {
-      signature.parameters.push_back(resolve_type(param->type));
+      resolved_params.push_back(resolve_type(param->type));
     }
-    if (!signature.result->valid ||
-        std::any_of(signature.parameters.begin(), signature.parameters.end(),
-                    [](const TypeInfo &param) { return !param.valid; })) {
-      signature.valid = false;
-    }
-    return signature;
+    return types.get_function(ret, resolved_params, nominal_name);
   }
 
-  TypeInfo resolve_type(const Type *type) {
+  const SemType *resolve_type(const Type *type) {
     if (type == nullptr) {
-      return invalid_type();
+      return types.invalid_type();
     }
 
     switch (type->kind) {
+    case TypeKind::Int:
+      return types.int_type();
+    case TypeKind::Bool:
+      return types.bool_type();
+    case TypeKind::Char:
+      return types.char_type();
+    case TypeKind::String:
+      return types.string_type();
+    case TypeKind::Void:
+      return types.void_type();
     case TypeKind::Pointer:
-    case TypeKind::Array: {
-      TypeInfo resolved;
-      resolved.kind = type->kind;
-      resolved.element =
-          std::make_shared<TypeInfo>(resolve_type(type->elem_type));
-      resolved.valid = resolved.element->valid;
-      return resolved;
+      return types.get_pointer(resolve_type(type->elem_type));
+    case TypeKind::Array:
+      return types.get_array(resolve_type(type->elem_type));
+    case TypeKind::Struct: {
+      const SymbolId id = symbols.intern(type->name);
+      if (!is_struct_declared(id)) {
+        report(*type, "unknown struct type '" + type->name + "'");
+        return types.invalid_type();
+      }
+      return types.get_struct(id);
     }
     case TypeKind::Alias: {
-      const auto function_alias = function_aliases.find(type->name);
-      if (function_alias != function_aliases.end()) {
-        TypeInfo signature =
-            function_signature(function_alias->second->return_type,
-                               function_alias->second->params);
-        signature.nominal_name = type->name;
-        return signature;
+      const SymbolId id = symbols.intern(type->name);
+      if (const FnTypeDef *fn_alias = lookup_dense(function_aliases, id)) {
+        return function_signature(fn_alias->return_type, fn_alias->params, id);
       }
-      const auto alias = aliases.find(type->name);
-      if (alias == aliases.end()) {
+      const TypeDef *alias = lookup_dense(aliases, id);
+      if (alias == nullptr) {
         report(*type, "unknown type name '" + type->name + "'");
-        return invalid_type();
+        return types.invalid_type();
       }
-      if (!resolving_aliases.insert(type->name).second) {
+      ensure_slot(resolving_aliases, id);
+      if (resolving_aliases[id] != 0) {
         report(*type, "cyclic type alias '" + type->name + "'");
-        return invalid_type();
+        return types.invalid_type();
       }
-      TypeInfo resolved = resolve_type(alias->second->target_type);
-      resolving_aliases.erase(type->name);
+      resolving_aliases[id] = 1;
+      const SemType *resolved = resolve_type(alias->target_type);
+      resolving_aliases[id] = 0;
       return resolved;
     }
-    case TypeKind::Struct:
-      if (!structs.contains(type->name)) {
-        report(*type, "unknown struct type '" + type->name + "'");
-        return invalid_type();
-      }
-      {
-        TypeInfo resolved;
-        resolved.kind = TypeKind::Struct;
-        resolved.name = type->name;
-        return resolved;
-      }
-    default:
-      return primitive(type->kind);
+    case TypeKind::FunctionPointer:
+      return types.invalid_type();
     }
-  }
-
-  bool is_void(const TypeInfo &type) const {
-    return type.valid && !type.is_null && type.kind == TypeKind::Void;
-  }
-
-  bool is_large_type(const TypeInfo &type) const {
-    return type.valid && type.kind == TypeKind::Struct;
-  }
-
-  bool is_undefined_struct(const TypeInfo &type) const {
-    if (!is_large_type(type)) {
-      return false;
-    }
-    const auto found = structs.find(type.name);
-    return found == structs.end() || !found->second.defined;
+    return types.invalid_type();
   }
 
   void check_function_signature(Type *return_type,
                                 const std::vector<ParamDecl *> &params,
                                 const ASTNode &declaration) {
-    if (is_large_type(resolve_type(return_type))) {
+    const SemType *ret = resolve_type(return_type);
+    if (ret->is_large()) {
       report(declaration, "functions cannot return a struct type");
     }
     for (const ParamDecl *param : params) {
-      const TypeInfo param_type = resolve_type(param->type);
-      if (is_large_type(param_type)) {
+      const SemType *param_type = resolve_type(param->type);
+      if (param_type->is_large()) {
         report(*param, "function parameters cannot have a struct type");
       }
-      if (param_type.valid && param_type.kind == TypeKind::FunctionPointer) {
+      if (param_type->is_valid() && param_type->is_function()) {
         report(*param,
                "function parameters cannot have a function type; use a "
                "pointer to a function type");
@@ -226,217 +257,251 @@ struct TypeChecker::Impl {
     }
   }
 
-  bool is_int(const TypeInfo &type) const {
-    return type.valid && type.kind == TypeKind::Int;
-  }
-
-  bool is_char(const TypeInfo &type) const {
-    return type.valid && type.kind == TypeKind::Char;
-  }
-
-  bool is_bool(const TypeInfo &type) const {
-    return type.valid && type.kind == TypeKind::Bool;
-  }
-
-  bool is_lvalue(const Exp *exp) const {
+  bool is_lvalue(const Exp *exp) const noexcept {
     if (exp == nullptr || !exp->is_lvalue()) {
       return false;
     }
-    if (const auto *variable = dynamic_cast<const VarExp *>(exp)) {
-      for (size_t index = scopes.size(); index > scope_floor; --index) {
-        if (scopes[index - 1].contains(variable->name)) {
-          return true;
-        }
-      }
-      return false;
+    if (exp->ast_kind == ASTKind::VarExp) {
+      const auto *var = static_cast<const VarExp *>(exp);
+      return var->symbol_kind == SymbolKind::LocalVar ||
+             var->symbol_kind == SymbolKind::Param;
     }
     return true;
   }
 
-  std::optional<TypeInfo> lookup_variable(const std::string &name) const {
-    for (size_t index = scopes.size(); index > scope_floor; --index) {
-      const auto &scope = scopes[index - 1];
-      const auto found = scope.find(name);
-      if (found != scope.end()) {
-        return found->second;
-      }
-    }
-    return std::nullopt;
-  }
+  void collect_types(Program &program) {
+    std::vector<StructFieldDesc> field_descs;
 
-  bool declare_variable(const std::string &name, const TypeInfo &type,
-                        const ASTNode &node) {
-    if (scopes.empty()) {
-      scopes.emplace_back();
-    }
-    for (size_t index = scope_floor; index < scopes.size(); ++index) {
-      if (scopes[index].contains(name)) {
-        report(node, "variable '" + name +
-                         "' is already declared in an enclosing or current scope");
-        return false;
+    for (TopDecl *decl : program.decls) {
+      if (!decl) {
+        continue;
       }
-    }
-    if (functions.contains(name)) {
-      report(node, "variable '" + name +
-                       "' conflicts with a function declaration");
-      return false;
-    }
-    if (is_void(type)) {
-      report(node, "variable '" + name + "' cannot have type void");
-      return false;
-    }
-    scopes.back().emplace(name, type);
-    return true;
-  }
-
-  void collect_types(const Program &program) {
-    for (const TopDecl *decl : program.decls) {
-      if (const auto *struct_decl = dynamic_cast<const StructDecl *>(decl)) {
-        structs.try_emplace(struct_decl->name);
-        if (aliases.contains(struct_decl->name) ||
-            function_aliases.contains(struct_decl->name)) {
-          report(*struct_decl, "duplicate struct declaration '" +
-                                   struct_decl->name + "'");
+      switch (decl->ast_kind) {
+      case ASTKind::StructDecl: {
+        auto *struct_decl = static_cast<StructDecl *>(decl);
+        const SymbolId id = symbols.intern(struct_decl->name);
+        types.get_or_create_struct_desc(id);
+        ensure_slot(struct_declared, id);
+        struct_declared[id] = 1;
+        if (lookup_dense(aliases, id) != nullptr ||
+            lookup_dense(function_aliases, id) != nullptr) {
+          report(*struct_decl,
+                 "duplicate struct declaration '" + struct_decl->name + "'");
         }
-      } else if (const auto *struct_def =
-                     dynamic_cast<const StructDef *>(decl)) {
-        auto &info = structs[struct_def->name];
-        if (aliases.contains(struct_def->name) ||
-            function_aliases.contains(struct_def->name)) {
+        break;
+      }
+      case ASTKind::StructDef: {
+        auto *struct_def = static_cast<StructDef *>(decl);
+        const SymbolId id = symbols.intern(struct_def->name);
+        StructDesc *desc = types.get_or_create_struct_desc(id);
+        struct_def->symbol_id = id;
+        struct_def->struct_desc = desc;
+        ensure_slot(struct_declared, id);
+        struct_declared[id] = 1;
+
+        if (lookup_dense(aliases, id) != nullptr ||
+            lookup_dense(function_aliases, id) != nullptr) {
           report(*struct_def, "duplicate type name '" + struct_def->name + "'");
         }
-        if (info.defined) {
+        const bool already_defined = desc->defined;
+        if (already_defined) {
           report(*struct_def,
                  "duplicate definition of struct '" + struct_def->name + "'");
-        } else {
-          info.defined = true;
         }
-        for (const FieldDecl *field : struct_def->fields) {
-          const TypeInfo field_type = resolve_type(field->type);
-          if (is_large_type(field_type)) {
+
+        field_descs.clear();
+        uint32_t field_idx = 0;
+        for (FieldDecl *field : struct_def->fields) {
+          const SemType *field_type = resolve_type(field->type);
+          if (field_type->is_large()) {
             report(*field, "struct fields cannot have a struct type");
           }
-          if (field_type.valid &&
-              field_type.kind == TypeKind::FunctionPointer) {
+          if (field_type->is_valid() && field_type->is_function()) {
             report(*field,
                    "struct fields cannot have a function type; use a pointer "
                    "to a function type");
           }
-          if (info.fields.contains(field->name)) {
+
+          const SymbolId fid = symbols.intern(field->name);
+          const bool dup = std::any_of(
+              field_descs.begin(), field_descs.end(),
+              [fid](const StructFieldDesc &d) { return d.name == fid; });
+          if (dup) {
             report(*field, "duplicate field '" + field->name +
                                "' in struct '" + struct_def->name + "'");
           } else {
-            info.fields.emplace(field->name, field_type);
+            field->symbol_id = fid;
+            field->field_index = field_idx;
+            field->sem_type = field_type;
+            field_descs.push_back(StructFieldDesc{fid, field_type, field_idx});
+            ++field_idx;
           }
         }
-      } else if (const auto *alias = dynamic_cast<const TypeDef *>(decl)) {
-        if (aliases.contains(alias->alias_name) ||
-            function_aliases.contains(alias->alias_name) ||
-            structs.contains(alias->alias_name)) {
+        if (!already_defined) {
+          types.set_struct_fields(desc, field_descs);
+        }
+        break;
+      }
+      case ASTKind::TypeDef: {
+        auto *alias = static_cast<TypeDef *>(decl);
+        const SymbolId id = symbols.intern(alias->alias_name);
+        if (lookup_dense(aliases, id) != nullptr ||
+            lookup_dense(function_aliases, id) != nullptr ||
+            is_struct_declared(id)) {
           report(*alias, "duplicate type name '" + alias->alias_name + "'");
         } else {
-          aliases.emplace(alias->alias_name, alias);
+          ensure_slot(aliases, id);
+          aliases[id] = alias;
         }
-      } else if (const auto *function_alias =
-                     dynamic_cast<const FnTypeDef *>(decl)) {
-        if (aliases.contains(function_alias->name) ||
-            function_aliases.contains(function_alias->name) ||
-            structs.contains(function_alias->name)) {
-          report(*function_alias,
-                 "duplicate type name '" + function_alias->name + "'");
+        break;
+      }
+      case ASTKind::FnTypeDef: {
+        auto *fn_alias = static_cast<FnTypeDef *>(decl);
+        const SymbolId id = symbols.intern(fn_alias->name);
+        if (lookup_dense(aliases, id) != nullptr ||
+            lookup_dense(function_aliases, id) != nullptr ||
+            is_struct_declared(id)) {
+          report(*fn_alias, "duplicate type name '" + fn_alias->name + "'");
         } else {
-          function_aliases.emplace(function_alias->name, function_alias);
+          ensure_slot(function_aliases, id);
+          function_aliases[id] = fn_alias;
         }
+        break;
+      }
+      default:
+        break;
       }
     }
 
-    for (const auto &[name, alias] : aliases) {
-      (void)name;
-      resolve_type(alias->target_type);
+    for (const TypeDef *alias : aliases) {
+      if (alias) {
+        resolve_type(alias->target_type);
+      }
     }
-    for (const auto &[name, alias] : function_aliases) {
-      (void)name;
-      function_signature(alias->return_type, alias->params);
-      check_function_signature(alias->return_type, alias->params, *alias);
+    for (std::size_t i = 0; i < function_aliases.size(); ++i) {
+      const FnTypeDef *fn_alias = function_aliases[i];
+      if (fn_alias) {
+        function_signature(fn_alias->return_type, fn_alias->params,
+                           static_cast<SymbolId>(i));
+        check_function_signature(fn_alias->return_type, fn_alias->params,
+                                 *fn_alias);
+      }
     }
   }
 
-  void collect_functions(const Program &program) {
-    for (const TopDecl *decl : program.decls) {
-      const auto *function_decl = dynamic_cast<const FnDecl *>(decl);
-      const auto *function_def = dynamic_cast<const FnDef *>(decl);
-      if (function_decl == nullptr && function_def == nullptr) {
+  void collect_functions(Program &program) {
+    for (TopDecl *decl : program.decls) {
+      if (!decl) {
+        continue;
+      }
+      FnDecl *function_decl = nullptr;
+      FnDef *function_def = nullptr;
+      if (decl->ast_kind == ASTKind::FnDecl) {
+        function_decl = static_cast<FnDecl *>(decl);
+      } else if (decl->ast_kind == ASTKind::FnDef) {
+        function_def = static_cast<FnDef *>(decl);
+      } else {
         continue;
       }
 
       const std::string &name =
-          function_decl != nullptr ? function_decl->name : function_def->name;
-      TypeInfo signature =
-          function_decl != nullptr
-              ? function_signature(function_decl->return_type,
-                                   function_decl->params)
-              : function_signature(function_def->return_type,
-                                   function_def->params);
-      check_function_signature(
-          function_decl != nullptr ? function_decl->return_type
-                                   : function_def->return_type,
-          function_decl != nullptr ? function_decl->params
-                                   : function_def->params,
-          *decl);
-      auto [it, inserted] =
-          functions.emplace(name, FunctionInfo{signature, false});
-      if (!inserted && !same_type(it->second.signature, signature)) {
-        report(*decl, "conflicting declaration of function '" + name + "'");
+          function_decl ? function_decl->name : function_def->name;
+      Type *ret_type =
+          function_decl ? function_decl->return_type : function_def->return_type;
+      const auto &params =
+          function_decl ? function_decl->params : function_def->params;
+
+      const SymbolId id = symbols.intern(name);
+      const SemType *signature = function_signature(ret_type, params);
+      check_function_signature(ret_type, params, *decl);
+
+      if (function_decl) {
+        function_decl->symbol_id = id;
+        function_decl->fn_sig = signature;
+      } else {
+        function_def->symbol_id = id;
+        function_def->fn_sig = signature;
       }
+
+      ensure_slot(function_index, id);
+      if (function_index[id] == 0) {
+        functions.push_back(FunctionInfo{signature, false, nullptr, function_decl});
+        function_index[id] = static_cast<uint32_t>(functions.size());
+      } else {
+        FunctionInfo &existing = functions[function_index[id] - 1];
+        if (!TypeContext::same_type(existing.signature, signature)) {
+          report(*decl, "conflicting declaration of function '" + name + "'");
+        }
+        if (existing.decl_node == nullptr && function_decl != nullptr) {
+          existing.decl_node = function_decl;
+        }
+      }
+
       if (function_def != nullptr) {
-        if (it->second.defined) {
+        FunctionInfo &info = functions[function_index[id] - 1];
+        if (info.defined) {
           report(*function_def,
                  "duplicate definition of function '" + name + "'");
         } else {
-          it->second.defined = true;
-          it->second.signature = signature;
+          info.defined = true;
+          info.signature = signature;
+          info.def_node = function_def;
         }
       }
     }
   }
 
-  bool check_main(const Program &program) {
-    const auto main = functions.find("main");
-    if (main == functions.end() || !main->second.defined) {
+  bool check_main() {
+    const SymbolId main_id = symbols.find("main");
+    FunctionInfo *main_info =
+        (main_id != kInvalidSymbol) ? find_function(main_id) : nullptr;
+    if (main_info == nullptr || !main_info->defined) {
       driver.report_error(SourceLocation{1, 1},
                           "program must define int main() with no arguments");
       return false;
     }
-    const TypeInfo &signature = main->second.signature;
-    if (!signature.result || !is_int(*signature.result) ||
-        !signature.parameters.empty()) {
-      const auto definition = std::find_if(
-          program.decls.begin(), program.decls.end(), [](const TopDecl *decl) {
-            const auto *function = dynamic_cast<const FnDef *>(decl);
-            return function != nullptr && function->name == "main";
-          });
-      if (definition != program.decls.end()) {
-        report(**definition, "main must have type int main()");
+    const SemType *sig = main_info->signature;
+    if (!sig->is_function() || !sig->return_type->is_int() ||
+        sig->param_count != 0) {
+      if (main_info->def_node != nullptr) {
+        report(*main_info->def_node, "main must have type int main()");
       }
       return false;
     }
     return true;
   }
 
-  bool check(const Program &program) {
-    const size_t initial_errors = driver.error_count();
+  void reset_state(Program &program) {
     aliases.clear();
     function_aliases.clear();
-    structs.clear();
-    functions.clear();
-    scopes.clear();
-    scope_floor = 0;
-    loop_depth = 0;
+    struct_declared.clear();
     resolving_aliases.clear();
+    function_index.clear();
+    functions.clear();
+    active_vars.clear();
+    scope_trail.clear();
+    scope_marks.clear();
+    current_scope_depth = 0;
+    scope_floor_depth = 0;
+    loop_depth = 0;
+    current_return_type = types.invalid_type();
+    checking_function = false;
+    current_local_count = 0;
+    next_lambda_id = 0;
+    current_program = &program;
+    program.hoisted_lambdas.clear();
+  }
+
+  bool check(Program &program) {
+    const std::size_t initial_errors = driver.error_count();
+    reset_state(program);
 
     bool saw_non_use_declaration = false;
     for (const TopDecl *decl : program.decls) {
-      if (dynamic_cast<const UseDirective *>(decl) != nullptr) {
+      if (!decl) {
+        continue;
+      }
+      if (decl->ast_kind == ASTKind::UseDirective) {
         if (saw_non_use_declaration) {
           report(*decl, "#use directives must precede all other declarations");
         }
@@ -447,48 +512,68 @@ struct TypeChecker::Impl {
 
     collect_types(program);
     collect_functions(program);
-    check_main(program);
+    check_main();
 
-    for (const TopDecl *decl : program.decls) {
-      if (const auto *definition = dynamic_cast<const FnDef *>(decl)) {
-        check_function(*definition);
+    for (TopDecl *decl : program.decls) {
+      if (decl && decl->ast_kind == ASTKind::FnDef) {
+        check_function(*static_cast<FnDef *>(decl));
       }
     }
+
+    DefiniteInitChecker::check(program, driver);
     return driver.error_count() == initial_errors;
   }
 
-  void check_function(const FnDef &function) {
-    scopes.emplace_back();
-    const TypeInfo signature =
-        function_signature(function.return_type, function.params);
+  void bind_parameters(const std::vector<ParamDecl *> &params,
+                       const SemType *sig) {
+    for (std::size_t i = 0; i < params.size(); ++i) {
+      ParamDecl *param = params[i];
+      const SemType *param_ty =
+          (sig && sig->is_function() && i < sig->param_count)
+              ? sig->params[i]
+              : resolve_type(param->type);
+      const SymbolId pid = symbols.intern(param->name);
+      uint32_t slot = kInvalidSlot;
+      declare_variable(pid, param->name, param_ty, SymbolKind::Param, *param,
+                       slot);
+      param->symbol_id = pid;
+      param->slot_id = slot;
+      param->sem_type = param_ty;
+    }
+  }
+
+  void check_function(FnDef &function) {
+    enter_scope();
+    const SemType *sig = function.fn_sig;
     current_return_type =
-        signature.result ? *signature.result : invalid_type();
+        (sig && sig->is_function()) ? sig->return_type
+                                    : resolve_type(function.return_type);
     checking_function = true;
     loop_depth = 0;
-    scope_floor = scopes.size() - 1;
+    scope_floor_depth = current_scope_depth;
+    current_local_count = 0;
 
-    for (size_t index = 0; index < function.params.size(); ++index) {
-      const ParamDecl *param = function.params[index];
-      declare_variable(param->name, signature.parameters[index], *param);
-    }
+    bind_parameters(function.params, sig);
 
-    const bool must_return = check_block(*function.body, false);
-    if (!is_void(current_return_type) && !must_return) {
+    const bool must_return =
+        function.body ? check_block(*function.body, false) : false;
+    if (!current_return_type->is_void() && !must_return) {
       report(function, "not all control paths in non-void function '" +
                            function.name + "' return a value");
     }
 
-    scopes.pop_back();
-    scope_floor = 0;
+    function.local_count = current_local_count;
+    exit_scope();
+    scope_floor_depth = 0;
     checking_function = false;
   }
 
-  bool check_block(const BlockStmt &block, bool create_scope = true) {
+  bool check_block(BlockStmt &block, bool create_scope = true) {
     if (create_scope) {
-      scopes.emplace_back();
+      enter_scope();
     }
     bool must_return = false;
-    for (const Stmt *statement : block.stmts) {
+    for (Stmt *statement : block.stmts) {
       if (statement == nullptr) {
         continue;
       }
@@ -496,193 +581,240 @@ struct TypeChecker::Impl {
       must_return = must_return || statement_returns;
     }
     if (create_scope) {
-      scopes.pop_back();
+      exit_scope();
     }
     return must_return;
   }
 
-  bool check_statement(const Stmt &statement) {
-    if (const auto *block = dynamic_cast<const BlockStmt *>(&statement)) {
-      return check_block(*block);
-    }
-    if (const auto *declaration =
-            dynamic_cast<const VarDeclStmt *>(&statement)) {
-      const TypeInfo type = resolve_type(declaration->type);
-      if (is_large_type(type)) {
-        report(*declaration, "variables cannot have a struct type");
+  bool check_statement(Stmt &statement) {
+    switch (statement.ast_kind) {
+    case ASTKind::BlockStmt:
+      return check_block(static_cast<BlockStmt &>(statement));
+
+    case ASTKind::VarDeclStmt: {
+      auto &decl = static_cast<VarDeclStmt &>(statement);
+      const SemType *type = resolve_type(decl.type);
+      if (type->is_large()) {
+        report(decl, "variables cannot have a struct type");
       }
-      if (type.valid && type.kind == TypeKind::FunctionPointer) {
-        report(*declaration,
-               "variables cannot have a function type; use a pointer to a "
-               "function type");
+      if (type->is_valid() && type->is_function()) {
+        report(decl, "variables cannot have a function type; use a pointer to a "
+                     "function type");
       }
-      declare_variable(declaration->name, type, *declaration);
-      if (declaration->init != nullptr) {
-        const TypeInfo value = check_expression(*declaration->init);
-        if (!compatible(type, value)) {
-          report(*declaration, "initializer type does not match variable '" +
-                                   declaration->name + "'");
+      if (decl.init != nullptr) {
+        const SemType *value = check_expression(*decl.init);
+        if (!TypeContext::compatible(type, value)) {
+          report(decl, "initializer type does not match variable '" +
+                           decl.name + "'");
+        } else {
+          concretize_null(decl.init, type);
         }
       }
+      const SymbolId id = symbols.intern(decl.name);
+      uint32_t slot = kInvalidSlot;
+      declare_variable(id, decl.name, type, SymbolKind::LocalVar, decl, slot);
+      decl.symbol_id = id;
+      decl.slot_id = slot;
+      decl.sem_type = type;
       return false;
     }
-    if (const auto *assignment =
-            dynamic_cast<const AssignStmt *>(&statement)) {
-      const TypeInfo target = check_expression(*assignment->lhs);
-      const TypeInfo value = check_expression(*assignment->rhs);
-      if (!is_lvalue(assignment->lhs)) {
-        report(*assignment, "assignment target is not an lvalue");
+
+    case ASTKind::AssignStmt: {
+      auto &assign = static_cast<AssignStmt &>(statement);
+      const SemType *target = check_expression(*assign.lhs);
+      const SemType *value = check_expression(*assign.rhs);
+      if (!is_lvalue(assign.lhs)) {
+        report(assign, "assignment target is not an lvalue");
       }
-      if (assignment->op == AssignOp::ASSIGN) {
-        if (is_large_type(target) || is_large_type(value)) {
-          report(*assignment, "struct values cannot be assigned");
+      if (assign.lhs->ast_kind == ASTKind::VarExp) {
+        const auto *var = static_cast<const VarExp *>(assign.lhs);
+        assign.lhs_slot_id = var->slot_id;
+        assign.lhs_symbol_kind = var->symbol_kind;
+      }
+      if (assign.op == AssignOp::ASSIGN) {
+        if (target->is_large() || value->is_large()) {
+          report(assign, "struct values cannot be assigned");
         }
-        if (!compatible(target, value)) {
-          report(*assignment, "assignment types do not match");
+        if (!TypeContext::compatible(target, value)) {
+          report(assign, "assignment types do not match");
+        } else {
+          concretize_null(assign.rhs, target);
         }
-      } else if (!is_int(target) || !is_int(value)) {
-        report(*assignment, "compound assignment requires int operands");
+      } else if (!target->is_int() || !value->is_int()) {
+        report(assign, "compound assignment requires int operands");
       }
       return false;
     }
-    if (const auto *inc_dec =
-            dynamic_cast<const IncDecStmt *>(&statement)) {
-      const TypeInfo target = check_expression(*inc_dec->target);
-      if (!is_lvalue(inc_dec->target) || !is_int(target)) {
-        report(*inc_dec, "increment and decrement require an int lvalue");
+
+    case ASTKind::IncDecStmt: {
+      auto &inc_dec = static_cast<IncDecStmt &>(statement);
+      const SemType *target = check_expression(*inc_dec.target);
+      if (!is_lvalue(inc_dec.target) || !target->is_int()) {
+        report(inc_dec, "increment and decrement require an int lvalue");
       }
       return false;
     }
-    if (const auto *expression =
-            dynamic_cast<const ExprStmt *>(&statement)) {
-      check_expression(*expression->expr);
+
+    case ASTKind::ExprStmt: {
+      auto &expr_stmt = static_cast<ExprStmt &>(statement);
+      check_expression(*expr_stmt.expr);
       return false;
     }
-    if (const auto *conditional =
-            dynamic_cast<const IfStmt *>(&statement)) {
-      const TypeInfo condition = check_expression(*conditional->cond);
-      if (!is_bool(condition)) {
-        report(*conditional->cond, "if condition must have type bool");
+
+    case ASTKind::IfStmt: {
+      auto &cond_stmt = static_cast<IfStmt &>(statement);
+      const SemType *condition = check_expression(*cond_stmt.cond);
+      if (!condition->is_bool()) {
+        report(*cond_stmt.cond, "if condition must have type bool");
       }
-      const bool then_returns = check_statement(*conditional->then_branch);
+      const bool then_returns = check_statement(*cond_stmt.then_branch);
       const bool else_returns =
-          conditional->else_branch != nullptr &&
-          check_statement(*conditional->else_branch);
-      return conditional->else_branch != nullptr && then_returns &&
-             else_returns;
+          cond_stmt.else_branch != nullptr &&
+          check_statement(*cond_stmt.else_branch);
+      return cond_stmt.else_branch != nullptr && then_returns && else_returns;
     }
-    if (const auto *loop = dynamic_cast<const WhileStmt *>(&statement)) {
-      scopes.emplace_back();
-      const TypeInfo condition = check_expression(*loop->cond);
-      if (!is_bool(condition)) {
-        report(*loop->cond, "while condition must have type bool");
+
+    case ASTKind::WhileStmt: {
+      auto &loop = static_cast<WhileStmt &>(statement);
+      enter_scope();
+      const SemType *condition = check_expression(*loop.cond);
+      if (!condition->is_bool()) {
+        report(*loop.cond, "while condition must have type bool");
       }
       ++loop_depth;
-      check_statement(*loop->body);
+      check_statement(*loop.body);
       --loop_depth;
-      scopes.pop_back();
+      exit_scope();
       return false;
     }
-    if (const auto *loop = dynamic_cast<const ForStmt *>(&statement)) {
-      scopes.emplace_back();
-      if (loop->init != nullptr) {
-        check_statement(*loop->init);
+
+    case ASTKind::ForStmt: {
+      auto &loop = static_cast<ForStmt &>(statement);
+      enter_scope();
+      if (loop.init != nullptr) {
+        check_statement(*loop.init);
       }
-      const TypeInfo condition = check_expression(*loop->cond);
-      if (!is_bool(condition)) {
-        report(*loop->cond, "for condition must have type bool");
+      const SemType *condition = check_expression(*loop.cond);
+      if (!condition->is_bool()) {
+        report(*loop.cond, "for condition must have type bool");
       }
-      if (loop->step != nullptr) {
-        check_statement(*loop->step);
+      if (loop.step != nullptr) {
+        check_statement(*loop.step);
       }
       ++loop_depth;
-      check_statement(*loop->body);
+      check_statement(*loop.body);
       --loop_depth;
-      scopes.pop_back();
+      exit_scope();
       return false;
     }
-    if (const auto *ret = dynamic_cast<const ReturnStmt *>(&statement)) {
+
+    case ASTKind::ReturnStmt: {
+      auto &ret = static_cast<ReturnStmt &>(statement);
       if (!checking_function) {
-        report(*ret, "return statement is not inside a function");
+        report(ret, "return statement is not inside a function");
         return false;
       }
-      if (ret->val == nullptr) {
-        if (!is_void(current_return_type)) {
-          report(*ret, "non-void function must return a value");
+      if (ret.val == nullptr) {
+        if (!current_return_type->is_void()) {
+          report(ret, "non-void function must return a value");
           return false;
         }
       } else {
-        const TypeInfo value = check_expression(*ret->val);
-        if (is_void(current_return_type) ||
-            !compatible(current_return_type, value)) {
-          report(*ret, "return value type does not match function return type");
+        const SemType *value = check_expression(*ret.val);
+        if (current_return_type->is_void() ||
+            !TypeContext::compatible(current_return_type, value)) {
+          report(ret, "return value type does not match function return type");
           return false;
         }
+        concretize_null(ret.val, current_return_type);
       }
       return true;
     }
-    if (const auto *assertion =
-            dynamic_cast<const AssertStmt *>(&statement)) {
-      const TypeInfo condition = check_expression(*assertion->cond);
-      if (!is_bool(condition)) {
-        report(*assertion->cond, "assert condition must have type bool");
+
+    case ASTKind::AssertStmt: {
+      auto &assertion = static_cast<AssertStmt &>(statement);
+      const SemType *condition = check_expression(*assertion.cond);
+      if (!condition->is_bool()) {
+        report(*assertion.cond, "assert condition must have type bool");
       }
       return false;
     }
-    if (const auto *error = dynamic_cast<const ErrorStmt *>(&statement)) {
-      const TypeInfo message = check_expression(*error->msg);
-      if (message.valid && message.kind != TypeKind::String) {
-        report(*error->msg, "error message must have type string");
+
+    case ASTKind::ErrorStmt: {
+      auto &err = static_cast<ErrorStmt &>(statement);
+      const SemType *message = check_expression(*err.msg);
+      if (message->is_valid() && !message->is_string()) {
+        report(*err.msg, "error message must have type string");
       }
       return true;
     }
-    if (dynamic_cast<const BreakStmt *>(&statement) != nullptr) {
+
+    case ASTKind::BreakStmt:
       if (loop_depth == 0) {
         report(statement, "break statement must be inside a loop");
       }
       return false;
-    }
-    if (dynamic_cast<const ContinueStmt *>(&statement) != nullptr) {
+
+    case ASTKind::ContinueStmt:
       if (loop_depth == 0) {
         report(statement, "continue statement must be inside a loop");
       }
       return false;
+
+    default:
+      return false;
     }
-    return false;
   }
 
-  TypeInfo check_expression(const Exp &expression) {
-    if (dynamic_cast<const IntLitExp *>(&expression) != nullptr) {
-      return primitive(TypeKind::Int);
-    }
-    if (dynamic_cast<const BoolLitExp *>(&expression) != nullptr) {
-      return primitive(TypeKind::Bool);
-    }
-    if (dynamic_cast<const CharLitExp *>(&expression) != nullptr) {
-      return primitive(TypeKind::Char);
-    }
-    if (dynamic_cast<const StringLitExp *>(&expression) != nullptr) {
-      return primitive(TypeKind::String);
-    }
-    if (dynamic_cast<const NullLitExp *>(&expression) != nullptr) {
-      return null_type();
-    }
-    if (const auto *variable = dynamic_cast<const VarExp *>(&expression)) {
-      const auto local = lookup_variable(variable->name);
-      if (local.has_value()) {
-        return *local;
+  const SemType *check_expression(Exp &expression) {
+    switch (expression.ast_kind) {
+    case ASTKind::IntLitExp:
+      expression.sem_type = types.int_type();
+      return expression.sem_type;
+
+    case ASTKind::BoolLitExp:
+      expression.sem_type = types.bool_type();
+      return expression.sem_type;
+
+    case ASTKind::CharLitExp:
+      expression.sem_type = types.char_type();
+      return expression.sem_type;
+
+    case ASTKind::StringLitExp:
+      expression.sem_type = types.string_type();
+      return expression.sem_type;
+
+    case ASTKind::NullLitExp:
+      expression.sem_type = types.null_type();
+      return expression.sem_type;
+
+    case ASTKind::VarExp: {
+      auto &var = static_cast<VarExp &>(expression);
+      const SymbolId id = symbols.intern(var.name);
+      var.symbol_id = id;
+      if (const VarBinding *local = lookup_variable(id)) {
+        var.slot_id = local->slot_id;
+        var.symbol_kind = local->kind;
+        var.sem_type = local->type;
+        return var.sem_type;
       }
-      const auto function = functions.find(variable->name);
-      if (function != functions.end()) {
-        return function->second.signature;
+      if (FunctionInfo *fn = find_function(id)) {
+        var.symbol_kind = SymbolKind::Function;
+        var.resolved_fn_def = fn->def_node;
+        var.resolved_fn_decl = fn->decl_node;
+        var.sem_type = fn->signature;
+        return var.sem_type;
       }
-      report(*variable, "undeclared identifier '" + variable->name + "'");
-      return invalid_type();
+      report(var, "undeclared identifier '" + var.name + "'");
+      var.sem_type = types.invalid_type();
+      return var.sem_type;
     }
-    if (const auto *binary = dynamic_cast<const BinaryExp *>(&expression)) {
-      const TypeInfo lhs = check_expression(*binary->lhs);
-      const TypeInfo rhs = check_expression(*binary->rhs);
-      switch (binary->op) {
+
+    case ASTKind::BinaryExp: {
+      auto &binary = static_cast<BinaryExp &>(expression);
+      const SemType *lhs = check_expression(*binary.lhs);
+      const SemType *rhs = check_expression(*binary.rhs);
+      switch (binary.op) {
       case BinaryOp::ADD:
       case BinaryOp::SUB:
       case BinaryOp::MUL:
@@ -693,251 +825,387 @@ struct TypeChecker::Impl {
       case BinaryOp::BIT_AND:
       case BinaryOp::BIT_XOR:
       case BinaryOp::BIT_OR:
-        if (!is_int(lhs) || !is_int(rhs)) {
-          report(*binary, "arithmetic and bitwise operators require int operands");
-          return invalid_type();
+        if (!lhs->is_int() || !rhs->is_int()) {
+          report(binary, "arithmetic and bitwise operators require int operands");
+          binary.sem_type = types.invalid_type();
+          return binary.sem_type;
         }
-        return primitive(TypeKind::Int);
+        binary.sem_type = types.int_type();
+        return binary.sem_type;
+
       case BinaryOp::LT:
       case BinaryOp::LE:
       case BinaryOp::GT:
       case BinaryOp::GE:
-        if (!(is_int(lhs) && is_int(rhs)) &&
-            !(is_char(lhs) && is_char(rhs))) {
-          report(*binary,
+        if (!(lhs->is_int() && rhs->is_int()) &&
+            !(lhs->is_char() && rhs->is_char())) {
+          report(binary,
                  "relational operators require matching int or char operands");
         }
-        return primitive(TypeKind::Bool);
+        binary.sem_type = types.bool_type();
+        return binary.sem_type;
+
       case BinaryOp::EQ:
       case BinaryOp::NE:
-        if (lhs.kind == TypeKind::String || rhs.kind == TypeKind::String ||
-            is_large_type(lhs) || is_large_type(rhs)) {
-          report(*binary, "equality operators do not support string or struct operands");
-        } else if (!(lhs.is_null && rhs.is_null) && !compatible(lhs, rhs) &&
-                   !compatible(rhs, lhs)) {
-          report(*binary, "equality operands have incompatible types");
+        if (lhs->is_string() || rhs->is_string() || lhs->is_large() ||
+            rhs->is_large()) {
+          report(binary,
+                 "equality operators do not support string or struct operands");
+        } else if (!(lhs->is_null() && rhs->is_null()) &&
+                   !TypeContext::compatible(lhs, rhs) &&
+                   !TypeContext::compatible(rhs, lhs)) {
+          report(binary, "equality operands have incompatible types");
+        } else {
+          if (lhs->is_null() && rhs->is_pointer()) {
+            concretize_null(binary.lhs, rhs);
+          } else if (rhs->is_null() && lhs->is_pointer()) {
+            concretize_null(binary.rhs, lhs);
+          }
         }
-        return primitive(TypeKind::Bool);
+        binary.sem_type = types.bool_type();
+        return binary.sem_type;
+
       case BinaryOp::LOG_AND:
       case BinaryOp::LOG_OR:
-        if (!is_bool(lhs) || !is_bool(rhs)) {
-          report(*binary, "logical operators require bool operands");
+        if (!lhs->is_bool() || !rhs->is_bool()) {
+          report(binary, "logical operators require bool operands");
         }
-        return primitive(TypeKind::Bool);
+        binary.sem_type = types.bool_type();
+        return binary.sem_type;
       }
+      binary.sem_type = types.invalid_type();
+      return binary.sem_type;
     }
-    if (const auto *unary = dynamic_cast<const UnaryExp *>(&expression)) {
-      if (unary->op == UnaryOp::ADDR_OF) {
-        if (const auto *function = dynamic_cast<const VarExp *>(unary->operand)) {
-          if (!lookup_variable(function->name).has_value()) {
-            const auto found = functions.find(function->name);
-            if (found != functions.end()) {
-              if (!found->second.defined) {
-                report(*unary, "cannot take the address of undefined function '" +
-                                   function->name + "'");
-                return invalid_type();
+
+    case ASTKind::UnaryExp: {
+      auto &unary = static_cast<UnaryExp &>(expression);
+      if (unary.op == UnaryOp::ADDR_OF) {
+        if (unary.operand && unary.operand->ast_kind == ASTKind::VarExp) {
+          auto *fn_var = static_cast<VarExp *>(unary.operand);
+          const SymbolId id = symbols.intern(fn_var->name);
+          if (lookup_variable(id) == nullptr) {
+            if (FunctionInfo *found = find_function(id)) {
+              if (!found->defined) {
+                report(unary, "cannot take the address of undefined function '" +
+                                  fn_var->name + "'");
+                unary.sem_type = types.invalid_type();
+                return unary.sem_type;
               }
-              return pointer_to(found->second.signature);
+              fn_var->symbol_id = id;
+              fn_var->symbol_kind = SymbolKind::Function;
+              fn_var->resolved_fn_def = found->def_node;
+              fn_var->resolved_fn_decl = found->decl_node;
+              fn_var->sem_type = found->signature;
+              unary.sem_type = types.get_pointer(found->signature);
+              return unary.sem_type;
             }
           }
-          report(*unary, "address-of operator requires a defined function identifier");
-          return invalid_type();
+          report(unary, "address-of operator requires a defined function identifier");
+          unary.sem_type = types.invalid_type();
+          return unary.sem_type;
         }
-        check_expression(*unary->operand);
-        report(*unary, "address-of operator requires a defined function identifier");
-        return invalid_type();
+        if (unary.operand) {
+          check_expression(*unary.operand);
+        }
+        report(unary, "address-of operator requires a defined function identifier");
+        unary.sem_type = types.invalid_type();
+        return unary.sem_type;
       }
 
-      const TypeInfo operand = check_expression(*unary->operand);
-      switch (unary->op) {
+      const SemType *operand = check_expression(*unary.operand);
+      switch (unary.op) {
       case UnaryOp::LOG_NOT:
-        if (!is_bool(operand)) {
-          report(*unary, "logical not requires a bool operand");
+        if (!operand->is_bool()) {
+          report(unary, "logical not requires a bool operand");
         }
-        return primitive(TypeKind::Bool);
+        unary.sem_type = types.bool_type();
+        return unary.sem_type;
+
       case UnaryOp::BIT_NOT:
       case UnaryOp::NEG:
-        if (!is_int(operand)) {
-          report(*unary, "numeric unary operator requires an int operand");
+        if (!operand->is_int()) {
+          report(unary, "numeric unary operator requires an int operand");
         }
-        return primitive(TypeKind::Int);
+        unary.sem_type = types.int_type();
+        return unary.sem_type;
+
       case UnaryOp::DEREF:
-        if (operand.valid && operand.kind == TypeKind::Pointer &&
-            operand.element) {
-          return *operand.element;
+        if (operand->is_pointer()) {
+          unary.sem_type = operand->elem;
+          return unary.sem_type;
         }
-        report(*unary, "dereference requires a pointer operand");
-        return invalid_type();
+        report(unary, "dereference requires a pointer operand");
+        unary.sem_type = types.invalid_type();
+        return unary.sem_type;
+
       case UnaryOp::ADDR_OF:
         break;
       }
+      unary.sem_type = types.invalid_type();
+      return unary.sem_type;
     }
-    if (const auto *ternary =
-            dynamic_cast<const TernaryExp *>(&expression)) {
-      const TypeInfo condition = check_expression(*ternary->cond);
-      const TypeInfo true_type = check_expression(*ternary->true_branch);
-      const TypeInfo false_type = check_expression(*ternary->false_branch);
-      if (!is_bool(condition)) {
-        report(*ternary->cond, "conditional expression condition must be bool");
+
+    case ASTKind::TernaryExp: {
+      auto &ternary = static_cast<TernaryExp &>(expression);
+      const SemType *condition = check_expression(*ternary.cond);
+      const SemType *true_type = check_expression(*ternary.true_branch);
+      const SemType *false_type = check_expression(*ternary.false_branch);
+      if (!condition->is_bool()) {
+        report(*ternary.cond, "conditional expression condition must be bool");
       }
-      if (compatible(true_type, false_type)) {
-        return true_type.is_null ? false_type : true_type;
+      if (true_type->is_null() && false_type->is_null()) {
+        ternary.sem_type = types.null_type();
+        return ternary.sem_type;
       }
-      if (compatible(false_type, true_type)) {
-        return false_type.is_null ? true_type : false_type;
+      if (TypeContext::compatible(true_type, false_type)) {
+        if (true_type->is_null()) {
+          concretize_null(ternary.true_branch, false_type);
+          ternary.sem_type = false_type;
+        } else {
+          concretize_null(ternary.false_branch, true_type);
+          ternary.sem_type = true_type;
+        }
+        return ternary.sem_type;
       }
-      report(*ternary, "conditional expression branches have incompatible types");
-      return invalid_type();
+      if (TypeContext::compatible(false_type, true_type)) {
+        if (false_type->is_null()) {
+          concretize_null(ternary.false_branch, true_type);
+          ternary.sem_type = true_type;
+        } else {
+          concretize_null(ternary.true_branch, false_type);
+          ternary.sem_type = false_type;
+        }
+        return ternary.sem_type;
+      }
+      report(ternary, "conditional expression branches have incompatible types");
+      ternary.sem_type = types.invalid_type();
+      return ternary.sem_type;
     }
-    if (const auto *call = dynamic_cast<const CallExp *>(&expression)) {
-      const TypeInfo callee = check_expression(*call->callee);
-      const TypeInfo *signature = nullptr;
-      if (callee.valid && callee.kind == TypeKind::FunctionPointer) {
-        signature = &callee;
-      } else if (callee.valid && callee.kind == TypeKind::Pointer &&
-                 callee.element &&
-                 callee.element->kind == TypeKind::FunctionPointer) {
-        signature = callee.element.get();
+
+    case ASTKind::CallExp: {
+      auto &call = static_cast<CallExp &>(expression);
+      const SemType *callee = check_expression(*call.callee);
+      const SemType *signature = nullptr;
+      if (callee->is_function()) {
+        signature = callee;
+      } else if (callee->is_pointer() && callee->elem &&
+                 callee->elem->is_function()) {
+        signature = callee->elem;
       }
 
-      std::vector<TypeInfo> arguments;
-      arguments.reserve(call->args.size());
-      for (const Exp *argument : call->args) {
-        arguments.push_back(check_expression(*argument));
+      if (call.callee->ast_kind == ASTKind::LambdaExp) {
+        const auto *lam = static_cast<const LambdaExp *>(call.callee);
+        call.call_kind = CallKind::InlineLambda;
+        call.resolved_lambda = lam;
+        call.callee_symbol = lam->synthesized_name;
+      } else if (call.callee->ast_kind == ASTKind::VarExp) {
+        const auto *var = static_cast<const VarExp *>(call.callee);
+        if (var->symbol_kind == SymbolKind::Function) {
+          call.call_kind = CallKind::DirectFn;
+          call.callee_symbol = var->symbol_id;
+          call.resolved_fn_def = var->resolved_fn_def;
+          call.resolved_fn_decl = var->resolved_fn_decl;
+        } else if (signature != nullptr) {
+          call.call_kind = CallKind::IndirectFnPtr;
+        }
+      } else if (signature != nullptr) {
+        call.call_kind = CallKind::IndirectFnPtr;
       }
+
+      const SemType *inline_args[8];
+      std::vector<const SemType *> heap_args;
+      const SemType **arg_types = inline_args;
+      if (call.args.size() > 8) {
+        heap_args.resize(call.args.size());
+        arg_types = heap_args.data();
+      }
+      for (std::size_t i = 0; i < call.args.size(); ++i) {
+        arg_types[i] = check_expression(*call.args[i]);
+      }
+
       if (signature == nullptr) {
-        report(*call, "called expression is not a function or function pointer");
-        return invalid_type();
+        report(call, "called expression is not a function or function pointer");
+        call.sem_type = types.invalid_type();
+        return call.sem_type;
       }
-      if (arguments.size() != signature->parameters.size()) {
-        report(*call, "function called with the wrong number of arguments");
+      if (call.args.size() != signature->param_count) {
+        report(call, "function called with the wrong number of arguments");
       }
-      const size_t count =
-          std::min(arguments.size(), signature->parameters.size());
-      for (size_t index = 0; index < count; ++index) {
-        if (!compatible(signature->parameters[index], arguments[index])) {
-          report(*call->args[index],
+      const std::size_t count =
+          std::min<std::size_t>(call.args.size(), signature->param_count);
+      for (std::size_t i = 0; i < count; ++i) {
+        const SemType *param_ty = signature->params[i];
+        if (!TypeContext::compatible(param_ty, arg_types[i])) {
+          report(*call.args[i],
                  "argument type does not match function parameter");
+        } else {
+          concretize_null(call.args[i], param_ty);
         }
       }
-      return signature->result ? *signature->result : invalid_type();
+      call.sem_type = signature->return_type;
+      return call.sem_type;
     }
-    if (const auto *field = dynamic_cast<const FieldExp *>(&expression)) {
-      TypeInfo base = check_expression(*field->base);
-      if (field->is_arrow) {
-        if (!base.valid || base.kind != TypeKind::Pointer || !base.element) {
-          report(*field, "arrow operator requires a pointer to a struct");
-          return invalid_type();
+
+    case ASTKind::FieldExp: {
+      auto &field = static_cast<FieldExp &>(expression);
+      const SemType *base = check_expression(*field.base);
+      if (field.is_arrow) {
+        if (!base->is_pointer()) {
+          report(field, "arrow operator requires a pointer to a struct");
+          field.sem_type = types.invalid_type();
+          return field.sem_type;
         }
-        base = *base.element;
+        base = base->elem;
       }
-      if (!base.valid || base.kind != TypeKind::Struct) {
-        report(*field, "field access requires a struct value");
-        return invalid_type();
+      if (!base->is_struct()) {
+        report(field, "field access requires a struct value");
+        field.sem_type = types.invalid_type();
+        return field.sem_type;
       }
-      const auto struct_info = structs.find(base.name);
-      if (struct_info == structs.end() || !struct_info->second.defined) {
-        report(*field, "field access on incomplete struct '" + base.name + "'");
-        return invalid_type();
+      const StructDesc *desc = base->struct_desc;
+      const std::string_view sname = symbols.resolve(desc->name);
+      if (!desc->defined) {
+        report(field, "field access on incomplete struct '" +
+                          std::string(sname) + "'");
+        field.sem_type = types.invalid_type();
+        return field.sem_type;
       }
-      const auto member = struct_info->second.fields.find(field->field_name);
-      if (member == struct_info->second.fields.end()) {
-        report(*field, "struct '" + base.name + "' has no field named '" +
-                           field->field_name + "'");
-        return invalid_type();
+      const SymbolId fid = symbols.intern(field.field_name);
+      const StructFieldDesc *member = desc->find_field(fid);
+      if (member == nullptr) {
+        report(field, "struct '" + std::string(sname) +
+                          "' has no field named '" + field.field_name + "'");
+        field.sem_type = types.invalid_type();
+        return field.sem_type;
       }
-      return member->second;
+      field.struct_desc = desc;
+      field.field_index = member->index;
+      field.sem_type = member->type;
+      return field.sem_type;
     }
-    if (const auto *index = dynamic_cast<const IndexExp *>(&expression)) {
-      const TypeInfo base = check_expression(*index->base);
-      const TypeInfo subscript = check_expression(*index->index);
-      if (!is_int(subscript)) {
-        report(*index->index, "array index must have type int");
+
+    case ASTKind::IndexExp: {
+      auto &index = static_cast<IndexExp &>(expression);
+      const SemType *base = check_expression(*index.base);
+      const SemType *subscript = check_expression(*index.index);
+      if (!subscript->is_int()) {
+        report(*index.index, "array index must have type int");
       }
-      if (base.valid && base.kind == TypeKind::Array && base.element) {
-        if (is_void(*base.element)) {
-          report(*index, "cannot index a void array");
-          return invalid_type();
+      if (base->is_array()) {
+        if (base->elem->is_void()) {
+          report(index, "cannot index a void array");
+          index.sem_type = types.invalid_type();
+          return index.sem_type;
         }
-        return *base.element;
+        index.sem_type = base->elem;
+        return index.sem_type;
       }
-      report(*index, "indexing requires an array");
-      return invalid_type();
+      report(index, "indexing requires an array");
+      index.sem_type = types.invalid_type();
+      return index.sem_type;
     }
-    if (const auto *allocation =
-            dynamic_cast<const AllocExp *>(&expression)) {
-      const TypeInfo allocated = resolve_type(allocation->alloc_type);
-      if (is_void(allocated)) {
-        report(*allocation, "cannot allocate void");
-        return invalid_type();
+
+    case ASTKind::AllocExp: {
+      auto &allocation = static_cast<AllocExp &>(expression);
+      const SemType *allocated = resolve_type(allocation.alloc_type);
+      if (allocated->is_void()) {
+        report(allocation, "cannot allocate void");
+        allocation.sem_type = types.invalid_type();
+        return allocation.sem_type;
       }
-      if (is_undefined_struct(allocated)) {
-        report(*allocation, "cannot allocate an undefined struct");
-        return invalid_type();
+      if (allocated->is_undefined_struct()) {
+        report(allocation, "cannot allocate an undefined struct");
+        allocation.sem_type = types.invalid_type();
+        return allocation.sem_type;
       }
-      return pointer_to(allocated);
+      allocation.sem_type = types.get_pointer(allocated);
+      return allocation.sem_type;
     }
-    if (const auto *allocation =
-            dynamic_cast<const AllocArrayExp *>(&expression)) {
-      const TypeInfo count = check_expression(*allocation->count);
-      if (!is_int(count)) {
-        report(*allocation->count, "array allocation count must have type int");
+
+    case ASTKind::AllocArrayExp: {
+      auto &allocation = static_cast<AllocArrayExp &>(expression);
+      const SemType *count = check_expression(*allocation.count);
+      if (!count->is_int()) {
+        report(*allocation.count, "array allocation count must have type int");
       }
-      const TypeInfo element = resolve_type(allocation->alloc_type);
-      if (is_void(element)) {
-        report(*allocation, "cannot allocate an array of void");
-        return invalid_type();
+      const SemType *element = resolve_type(allocation.alloc_type);
+      if (element->is_void()) {
+        report(allocation, "cannot allocate an array of void");
+        allocation.sem_type = types.invalid_type();
+        return allocation.sem_type;
       }
-      if (is_undefined_struct(element)) {
-        report(*allocation, "cannot allocate an undefined struct");
-        return invalid_type();
+      if (element->is_undefined_struct()) {
+        report(allocation, "cannot allocate an undefined struct");
+        allocation.sem_type = types.invalid_type();
+        return allocation.sem_type;
       }
-      TypeInfo array;
-      array.kind = TypeKind::Array;
-      array.element = std::make_shared<TypeInfo>(element);
-      array.valid = array.element->valid;
-      return array;
+      allocation.sem_type = types.get_array(element);
+      return allocation.sem_type;
     }
-    if (const auto *lambda = dynamic_cast<const LambdaExp *>(&expression)) {
-      TypeInfo signature = function_signature(lambda->return_type, lambda->params);
-      check_function_signature(lambda->return_type, lambda->params, *lambda);
-      const size_t previous_floor = scope_floor;
-      scopes.emplace_back();
-      scope_floor = scopes.size() - 1;
-      const TypeInfo previous_return_type = current_return_type;
+
+    case ASTKind::LambdaExp: {
+      auto &lambda = static_cast<LambdaExp &>(expression);
+      const SemType *signature =
+          function_signature(lambda.return_type, lambda.params);
+      check_function_signature(lambda.return_type, lambda.params, lambda);
+
+      const SymbolId synth =
+          symbols.intern("__c0_lambda_" + std::to_string(next_lambda_id++));
+      lambda.synthesized_name = synth;
+      lambda.fn_sig = signature;
+      if (current_program != nullptr) {
+        current_program->hoisted_lambdas.push_back(&lambda);
+      }
+
+      const uint32_t previous_floor = scope_floor_depth;
+      const SemType *previous_return_type = current_return_type;
       const bool previous_checking_function = checking_function;
-      const size_t previous_loop_depth = loop_depth;
-      current_return_type = signature.result ? *signature.result : invalid_type();
+      const uint32_t previous_loop_depth = loop_depth;
+      const uint32_t previous_local_count = current_local_count;
+
+      enter_scope();
+      scope_floor_depth = current_scope_depth;
+      current_return_type =
+          signature->is_function() ? signature->return_type
+                                   : resolve_type(lambda.return_type);
       checking_function = true;
       loop_depth = 0;
-      for (size_t index = 0; index < lambda->params.size(); ++index) {
-        declare_variable(lambda->params[index]->name, signature.parameters[index],
-                         *lambda->params[index]);
+      current_local_count = 0;
+
+      bind_parameters(lambda.params, signature);
+
+      const bool must_return =
+          lambda.body ? check_block(*lambda.body, false) : false;
+      if (!current_return_type->is_void() && !must_return) {
+        report(lambda, "not all control paths in non-void lambda return a value");
       }
-      if (!is_void(current_return_type) && !check_block(*lambda->body, false)) {
-        report(*lambda, "not all control paths in non-void lambda return a value");
-      } else if (is_void(current_return_type)) {
-        check_block(*lambda->body, false);
-      }
-      scopes.pop_back();
-      scope_floor = previous_floor;
+
+      lambda.local_count = current_local_count;
+      exit_scope();
+
+      scope_floor_depth = previous_floor;
       current_return_type = previous_return_type;
       checking_function = previous_checking_function;
       loop_depth = previous_loop_depth;
-      return pointer_to(signature);
+      current_local_count = previous_local_count;
+
+      lambda.sem_type = types.get_pointer(signature);
+      return lambda.sem_type;
     }
 
-    report(expression, "unsupported expression");
-    return invalid_type();
+    default:
+      report(expression, "unsupported expression");
+      expression.sem_type = types.invalid_type();
+      return expression.sem_type;
+    }
   }
 };
 
-TypeChecker::TypeChecker(Driver &driver) : impl_(std::make_unique<Impl>(driver)) {}
+TypeChecker::TypeChecker(Driver &driver)
+    : impl_(std::make_unique<Impl>(driver)) {}
 
 TypeChecker::~TypeChecker() = default;
 
-bool TypeChecker::check(const Program &program) {
-  return impl_->check(program);
-}
+bool TypeChecker::check(Program &program) { return impl_->check(program); }
 
 } // namespace c0

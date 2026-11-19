@@ -1,0 +1,8 @@
+int main() {
+    int next;
+    for (int i = 0; i < 3; i = next) {
+        if (i == 0) continue;
+        next = i + 1;
+    }
+    return 0;
+}

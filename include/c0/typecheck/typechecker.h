@@ -15,7 +15,7 @@ public:
   TypeChecker(const TypeChecker &) = delete;
   TypeChecker &operator=(const TypeChecker &) = delete;
 
-  bool check(const Program &program);
+  bool check(Program &program);
 
 private:
   struct Impl;

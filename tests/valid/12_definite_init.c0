@@ -1,0 +1,42 @@
+int branch_terminate(bool fail) {
+    int y;
+    if (fail) {
+        error("abort");
+    } else {
+        y = 10;
+    }
+    return y;
+}
+
+int main() {
+    int x;
+    if (true) {
+        x = 1;
+    } else {
+        x = 2;
+    }
+
+    int z;
+    if (x == 1) {
+        return branch_terminate(false) + x;
+    } else {
+        z = 42;
+    }
+
+    int next;
+    for (int i = 0; i < 3; i = next) {
+        next = i + 1;
+    }
+
+    int lam = [](int v) -> int {
+        int res;
+        if (v > 0) {
+            res = v;
+        } else {
+            res = 0;
+        }
+        return res;
+    }(z);
+
+    return lam;
+}

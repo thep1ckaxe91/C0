@@ -1,0 +1,9 @@
+typedef int fn(int x);
+
+int main() {
+    fn* f = [](int x) -> int {
+        int y;
+        return x + y;
+    };
+    return (*f)(1);
+}

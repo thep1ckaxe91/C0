@@ -18,7 +18,7 @@ int yyparse(yyscan_t scanner, c0::Driver *driver);
 
 namespace c0 {
 
-Driver::Driver() = default;
+Driver::Driver() : arena_(), symbols_(arena_), type_context_(arena_) {}
 Driver::~Driver() = default;
 
 void Driver::report_error(const SourceLocation &loc, const std::string &msg) {
@@ -36,12 +36,29 @@ void Driver::print_diagnostics(std::ostream &os) const {
   }
 }
 
-bool Driver::is_type_name(const std::string &name) const {
-  return type_names_.contains(name);
+const std::string &Driver::intern_string(std::string_view s) {
+  const SymbolId id = symbols_.intern(s);
+  if (id >= interned_strings_.size()) {
+    interned_strings_.resize(id + 1, nullptr);
+  }
+  if (interned_strings_[id] == nullptr) {
+    interned_strings_[id] = arena_.create<std::string>(symbols_.resolve(id));
+  }
+  return *interned_strings_[id];
 }
 
-void Driver::add_type_name(const std::string &name) {
-  type_names_.insert(name);
+bool Driver::is_type_name(std::string_view name) const {
+  const SymbolId id = symbols_.find(name);
+  return id != kInvalidSymbol && id < type_name_flags_.size() &&
+         type_name_flags_[id] != 0;
+}
+
+void Driver::add_type_name(std::string_view name) {
+  const SymbolId id = symbols_.intern(name);
+  if (id >= type_name_flags_.size()) {
+    type_name_flags_.resize(id + 1, 0);
+  }
+  type_name_flags_[id] = 1;
 }
 
 bool Driver::parse_file(const std::string &filepath) {
